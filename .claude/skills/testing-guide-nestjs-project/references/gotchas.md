@@ -1,195 +1,103 @@
 > Part of the `testing-guide-nestjs-project` skill (see `../SKILL.md`).
 
-# Gotchas & Pitfalls
+# Stack-Specific Gotchas & Pitfalls
 
-Stack-specific pitfalls for NestJS 11 + Jest 30 + TypeORM + PostgreSQL + ts-jest 29.
+Concrete traps for this NestJS 11 + TypeORM 0.3 + Jest 30 + ts-jest 29 + BullMQ/MinIO stack. Ordered roughly by how often they bite.
 
----
+## Jest / lifecycle
 
-## 1. `repository.delete({})` throws on empty criteria
+### Jest hangs after tests finish — open handles
+Two common causes in this project:
+1. **Nest app not closed** in E2E → `afterAll(async () => { await app.close(); });`.
+2. **BullMQ / `ioredis` connections left open** → `await queue.close()`, `await queueEvents.close()`, and `await moduleRef.close()` (which closes `@Processor` workers) in `afterAll`. `connection.disconnect()` is the reliable last-resort cleanup when a lingering Redis handle remains.
 
-**Problem:** `repository.delete({})` throws `Empty criteria(s) are not allowed for delete.` in TypeORM.
+When it still hangs: `npm test -- --runInBand --detectOpenHandles` to find the leak. `--forceExit` is a last resort — fix the leak first.
 
-**Fix:** Use `dataSource.query('DELETE FROM "table_name"')` or `repository.clear()` for table cleanup between tests.
+### `--runInBand` is mandatory for integration + E2E
+Integration and E2E share one Postgres and one Redis. Parallel Jest workers truncate/seed shared tables and queues concurrently → FK violations, deadlocks, cross-suite contamination. `test:integration` and `test:e2e` already set `--runInBand`; keep it (and pass it to `npm test` when running integration specs).
 
+### Await async job completion — never `setTimeout`
+For processor tests, block on `await job.waitUntilFinished(queueEvents)` or a `completed` listener. `setTimeout`-based waits are flaky and are the documented cause of "Jest did not exit one second after the test run completed" with BullMQ.
+
+## Database (TypeORM + Postgres)
+
+### `repository.delete({})` throws `Empty criteria(s) are not allowed`
+Use `dataSource.query('DELETE FROM "table"')`, the `cleanAllTables()` helper, or `repository.clear()` (TRUNCATE). For deep FK chains: `dataSource.query('TRUNCATE "videos", "channels", "users" CASCADE')`.
+
+### Extend `cleanAllTables()` in reverse-FK order for new entities
+`videos.channel_id → channels.id`, so `DELETE FROM "videos"` must run **before** `DELETE FROM "channels"`. Add new tables at the top of the delete sequence in `src/test/create-test-data-source.ts`.
+
+### Always quote table names in raw queries
+TypeORM keeps identifiers as declared; `DELETE FROM users` can fail depending on casing. Use `dataSource.query('DELETE FROM "users"')`, or derive the name: `dataSource.getRepository(User).metadata.tableName`.
+
+### `bigint` columns come back as strings
+TypeORM maps Postgres `bigint` (e.g., `Video.size_bytes`) to a JS `string` to preserve precision. Assert `expect(video.size_bytes).toBe('12884901888')`, or convert before numeric comparison — do not expect a `number`.
+
+### `synchronize: true` creates but does not reset schema
+`synchronize: true` (the `createTestDataSource` default) creates missing tables/columns but never drops renamed/removed ones. If you rename a column, the stale one persists. For a clean slate: `await dataSource.synchronize(true)` (drop + recreate — destructive, tests only), or drop the test DB before the suite. To test real migrations instead, use `createTestDataSource(entities, { synchronize: false, migrations: [...] })` (see `src/database/migrations.integration-spec.ts`).
+
+### `forRootAsync` + `ConfigType` needs a GLOBAL ConfigModule
+When the module under test (or an import) uses `X.forRootAsync({ inject: [someConfig.KEY], useFactory })`, the test module must include `ConfigModule.forRoot({ isGlobal: true, load: [someConfig] })`. `forRootAsync`'s factory context does not inherit non-global providers → cryptic "Nest can't resolve dependencies of the (?)" errors.
+
+## E2E (supertest)
+
+### `Test.createTestingModule()` does NOT run `main.ts`
+Global pipes/filters/interceptors/prefix from `main.ts` are skipped. Re-apply them in `beforeAll`:
 ```typescript
-// BAD
-await userRepository.delete({});
-
-// GOOD
-await dataSource.query('DELETE FROM "users"');
-// or
-await userRepository.clear();
+app.useGlobalPipes(new ValidationPipe({ whitelist: true }));
+app.useGlobalFilters(new DomainExceptionFilter(), new ValidationExceptionFilter());
+await app.init();
 ```
+Extract the global config into a shared function used by both `main.ts` and E2E setup to keep them in sync.
 
-For tables with foreign key dependencies, use `TRUNCATE ... CASCADE`:
-```typescript
-await dataSource.query('TRUNCATE "videos", "channels", "users" CASCADE');
-```
+### Overriding a guard registered with `APP_GUARD` + `useClass`
+`overrideProvider(SomeGuard).useValue(...)` does NOT intercept `{ provide: APP_GUARD, useClass: SomeGuard }` — `useClass` instantiates a fresh guard, not your token. Instead: (1) override the **state token** the guard depends on (`@nestjs/throttler`'s `ThrottlerStorage` symbol → `storage.clear()` in `beforeEach`), or (2) register the guard via `useExisting` so `overrideProvider` can target it.
 
----
-
-## 2. `Test.createTestingModule()` does NOT execute `main.ts`
-
-**Problem:** Global pipes, filters, interceptors, and prefixes set in `main.ts` are NOT applied in test modules. E2E tests that don't reproduce this config will behave differently from production.
-
-**Fix:** Manually apply all global config in E2E test setup:
-
-```typescript
-beforeAll(async () => {
-  const moduleFixture = await Test.createTestingModule({
-    imports: [AppModule],
-  }).compile();
-
-  app = moduleFixture.createNestApplication();
-
-  // Reproduce main.ts config
-  app.useGlobalPipes(new ValidationPipe({ whitelist: true }));
-  // app.useGlobalFilters(new DomainExceptionFilter());
-  // app.useGlobalInterceptors(new ResponseTransformInterceptor());
-  // app.setGlobalPrefix('api');
-
-  await app.init();
-});
-```
-
-**Tip:** Extract global config into a shared function used by both `main.ts` and E2E setup to keep them in sync.
-
----
-
-## 3. Forgetting `app.close()` causes Jest to hang
-
-**Problem:** If `afterAll(() => app.close())` is missing, Jest will hang after tests complete because database connections, queue connections, or HTTP server handles remain open.
-
-**Fix:** Always close the app and data sources:
-
-```typescript
-afterAll(async () => {
-  await app.close(); // closes all connections managed by NestJS
-});
-
-// For standalone DataSource (entity integration tests):
-afterAll(async () => {
-  await dataSource.destroy();
-});
-```
-
-If Jest still hangs, use `--forceExit` as a last resort, but investigate the leak first.
-
----
-
-## 4. ts-jest version mismatch with Jest 30
-
-**Problem:** The project uses Jest 30 but ts-jest 29.2.5. While ts-jest 29 is compatible with Jest 30 via a compatibility layer, you may encounter edge cases with ESM transforms or snapshot serializers.
-
-**Fix:** Monitor for issues. If transform errors appear, check if ts-jest has released a version 30.x. Until then, the current setup works for the project's `commonjs` module output.
-
----
-
-## 5. TypeORM `synchronize: true` in tests creates tables but doesn't reset
-
-**Problem:** `synchronize: true` creates tables if they don't exist and adds new columns, but it does NOT drop tables or remove columns. If you rename a column in an entity, the old column persists in the test DB.
-
-**Fix:** For a clean slate, either:
-- Drop and recreate the test database before the test suite
-- Use `dataSource.synchronize(true)` which drops all tables and recreates (destructive — only in tests)
-
-```typescript
-beforeAll(async () => {
-  await dataSource.initialize();
-  await dataSource.synchronize(true); // drop + recreate all tables
-});
-```
-
----
-
-## 6. PostgreSQL table names are case-sensitive in raw queries
-
-**Problem:** TypeORM may generate table names in different cases. Raw queries like `DELETE FROM users` will fail if the table is actually `"Users"`.
-
-**Fix:** Always quote table names in raw queries:
-```typescript
-// BAD
-await dataSource.query('DELETE FROM users');
-
-// GOOD
-await dataSource.query('DELETE FROM "users"');
-```
-
-**Better:** Use the entity metadata to get the actual table name:
-```typescript
-const tableName = dataSource.getRepository(User).metadata.tableName;
-await dataSource.query(`DELETE FROM "${tableName}"`);
-```
-
----
-
-## 7. E2E test imports vs unit test imports
-
-**Problem:** E2E tests import `AppModule` (the full application), while unit/integration tests import only the specific module or providers. Mixing these up leads to slow tests or incomplete setups.
-
-**Rule of thumb:**
-- **E2E** (`*.e2e-spec.ts`): `imports: [AppModule]` → full app, real HTTP stack
-- **Integration** (`*.integration.spec.ts`): `imports: [TypeOrmModule.forRoot(...), TypeOrmModule.forFeature([Entity])]` + specific providers
-- **Unit** (`*.spec.ts`): `providers: [ServiceUnderTest, { provide: Dep, useValue: mock }]` — no module imports
-
----
-
-## 8. `jest.mock()` with NestJS DI — prefer `useValue` over `jest.mock()`
-
-**Problem:** `jest.mock('./users.service')` at the module level replaces the entire module and fights with NestJS's DI system. It can cause subtle issues where the mock doesn't match the provider token.
-
-**Fix:** Use NestJS's built-in DI mocking:
-```typescript
-// GOOD — works with NestJS DI
-{ provide: UsersService, useValue: { findByEmail: jest.fn() } }
-
-// AVOID — fights with NestJS DI
-jest.mock('./users.service');
-```
-
----
-
-## 9. Parallel test execution and shared database
-
-**Problem:** Jest runs test files in parallel by default. If multiple integration test files share the same database tables, they can interfere with each other (e.g., one test cleans a table while another is mid-assertion).
-
-**Fix options:**
-- Run integration tests with `--runInBand` to serialize execution
-- Use transactions that rollback after each test (if feasible)
-- Use schema-per-test-file isolation (complex but fully parallel)
-
-For the `npm test` command, consider adding `--runInBand` when running integration tests:
-```bash
-npx jest --testPathPattern integration --runInBand
-```
-
----
-
-## 10. Supertest response types with `import request from 'supertest'`
-
-**Problem:** With `moduleResolution: "nodenext"`, supertest's default import may require specific type imports.
-
-**Fix:** Import as used in the project's existing E2E test:
+### Supertest import + typing under `nodenext`
+Match the existing E2E pattern:
 ```typescript
 import request from 'supertest';
 import { App } from 'supertest/types';
-
 let app: INestApplication<App>;
 ```
 
-This matches the existing `test/app.e2e-spec.ts` pattern and ensures type compatibility.
+## Auth / crypto
 
----
+### Argon2 is slow by design — lower cost in tests, do NOT mock
+The project hashes with **argon2** (argon2id, per `phase-02-auth/TD-01`), not bcrypt. OWASP prod minimums (19 MiB memory, 2 iterations) make each hash slow; a suite that registers many users drags. Use lower `memoryCost`/`timeCost` under `NODE_ENV=test`, but keep the **real** argon2 code path — mocking it would hide a wrong verify/hash config.
 
-## 11. Bcrypt in tests — use lower cost factor
+## Object storage (MinIO / AWS SDK v3)
 
-**Problem:** `bcrypt.hash()` with the default cost factor (10-12) is intentionally slow. Running many tests that hash passwords slows down the suite significantly.
+### `forcePathStyle: true` is required for MinIO
+Without it the SDK builds virtual-host URLs (`bucket.minio:9000`) MinIO does not serve. Set it on every test `S3Client`.
 
-**Fix:** Use a lower cost factor in test environment:
-```typescript
-const SALT_ROUNDS = process.env.NODE_ENV === 'test' ? 1 : 12;
-await bcrypt.hash(password, SALT_ROUNDS);
-```
+### MinIO `AccessDenied` about "unsigned headers"
+SDK v3 signs a specific header set; if the client (`fetch`/browser) sends a header not covered by the signature, MinIO rejects it. Keep `x-amz-*` headers signed (`unhoistableHeaders` on `getSignedUrl`) and don't add unsigned headers to the request. Assert presigned behavior with a **real** HTTP PUT/GET (200 / 206), never a mocked URL string. Sign against a host the test can actually reach (prod signs the public gateway, never `minio:9000`, per `TD-04`).
 
-Do NOT mock bcrypt — a lower cost factor is safe for tests and still exercises the real hashing code path.
+## Queue (BullMQ)
+
+### Integration = real queue inspection; unit = `add` spy
+Integration tests enqueue for real and read `queue.getJobs(['waiting'])`. Reserve `expect(queue.add).toHaveBeenCalledWith(...)` for **unit** tests where the queue is a mock provider (`getQueueToken`). Isolate state with `await queue.obliterate({ force: true })` (or `drain`) in `afterEach`, or a per-suite queue name.
+
+## SSE (`@Sse`)
+
+### `MessageEvent` comes from `@nestjs/common`, not the DOM
+Importing the DOM `MessageEvent` compiles but yields the wrong shape. Test an `@Sse` handler by subscribing to the returned `Observable<MessageEvent>` and asserting `data` (`firstValueFrom(obs.pipe(take(1)))`) — supertest does not cleanly consume an infinite stream. Be aware of a known Nest issue where piped SSE messages can arrive out of order under load.
+
+## FFmpeg
+
+### Binaries must be on `PATH`
+`execa('ffprobe'|'ffmpeg', ...)` fails if the binaries aren't installed; they live in the worker image (SI-03.10) or a CI step. Guard the suite with `describe.skip` when absent so the failure is explicit, and commit a small fixture video rather than generating one at runtime.
+
+## NestJS DI mocking
+
+### Prefer `useValue` over `jest.mock()`
+`jest.mock('./users.service')` replaces the whole module and fights NestJS DI (token mismatch). Use `{ provide: UsersService, useValue: { findByEmail: jest.fn() } }` instead. See `references/mock-health-rules.md`.
+
+### E2E vs unit imports
+- **E2E** (`*.e2e-spec.ts`): `imports: [AppModule]` — full app, real HTTP stack.
+- **Integration** (`*.integration-spec.ts`): specific `TypeOrmModule.forFeature([Entity])` / `BullModule` + the providers under test.
+- **Unit** (`*.spec.ts`): `providers: [Sut, { provide: Dep, useValue: mock }]` — no module imports beyond configured libs.
+
+### ts-jest 29 with Jest 30
+ts-jest 29.2.5 is compatible with Jest 30 for the project's `commonjs` output. If transform/ESM edge cases appear, check for a ts-jest 30.x release before working around it.

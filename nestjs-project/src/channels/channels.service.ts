@@ -9,11 +9,17 @@ const MAX_RETRIES = 5;
 
 function isPgUniqueViolationOnColumn(err: unknown, column: string): boolean {
   if (!(err instanceof QueryFailedError)) return false;
-  const e = err as any;
+  // pg surfaces the SQLSTATE `code` and `detail` on the driver error, which
+  // TypeORM copies onto QueryFailedError but does not type. Narrow via a typed
+  // cast (not `any`) so the property reads stay type-safe.
+  const { code, detail } = err as QueryFailedError & {
+    code?: string;
+    detail?: string;
+  };
   return (
-    e.code === PG_UNIQUE_VIOLATION &&
-    typeof e.detail === 'string' &&
-    e.detail.includes(column)
+    code === PG_UNIQUE_VIOLATION &&
+    typeof detail === 'string' &&
+    detail.includes(column)
   );
 }
 

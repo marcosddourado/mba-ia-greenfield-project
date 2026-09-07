@@ -37,13 +37,25 @@ describe('Database migrations (integration)', () => {
       ),
       dataSource.query(`DROP TABLE IF EXISTS "migrations" CASCADE`),
     ]);
+    // Enum types are independent objects — dropping a table does NOT drop the
+    // enum its column used, so a leftover `verification_tokens_type_enum` makes
+    // the migration's `CREATE TYPE` fail with "type already exists" against an
+    // already-migrated DB. Drop it explicitly (after the tables) for a clean slate.
+    await dataSource.query(
+      `DROP TYPE IF EXISTS "verification_tokens_type_enum" CASCADE`,
+    );
   });
 
   afterAll(async () => {
-    // The second test undoes the last migration, leaving token tables missing.
-    // Re-apply so the shared DB is fully migrated when subsequent suites run.
-    await dataSource.runMigrations();
-    await dataSource.destroy();
+    try {
+      // The second test undoes the last migration, leaving token tables missing.
+      // Re-apply so the shared DB is fully migrated when subsequent suites run.
+      await dataSource.runMigrations();
+    } finally {
+      // Always release the connection — a throw above must not leak an open
+      // handle that hangs Jest ("did not exit one second after the test run").
+      await dataSource.destroy();
+    }
   });
 
   it('should apply all migrations and create all four tables', async () => {

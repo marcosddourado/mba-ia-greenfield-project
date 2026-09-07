@@ -1,0 +1,9 @@
+# Masking storage gateway — the only host-facing door to MinIO.
+# Served over plain HTTP on :9000 (no hostname → no automatic HTTPS).
+# `header_up Host {host}` forwards the client's Host header unchanged so a
+# SigV4 presigned URL signed against the public host validates at MinIO.
+:9000 {
+	reverse_proxy minio:9000 {
+		header_up Host {host}
+	}
+}
