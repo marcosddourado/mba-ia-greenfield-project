@@ -1,7 +1,7 @@
 # phase-03-videos — Progress
 
 **Status:** in_progress
-**SIs:** 1/10 completed
+**SIs:** 3/10 completed
 
 ### SI-03.1 — Infra: storage, fila e worker (Docker Compose + config)
 - **Status:** completed
@@ -20,14 +20,25 @@
   - **Decision (user):** keep the parallel jest default — do NOT add `maxWorkers: 1`. Integration/E2E MUST be run with `--runInBand` (plain `npm test` runs the shared-DB integration suites in parallel and contaminates them → FK / enum-collision errors). Canonical: `docker compose exec nestjs-api npm test -- --runInBand` and `npm run test:e2e`.
 
 ### SI-03.2 — Entidade Video + migration
-- **Status:** pending
-- **Tests:** —
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 4 passing (`video.entity.integration-spec.ts` — default `draft`, unique `public_id`, FK `channel_id`, bigint `size_bytes` 10 GB)
+- **Observations:**
+  - `Video` entity created at `src/videos/entities/video.entity.ts` with the `VideoStatus` enum (`draft|uploading|processing|ready|failed`); snake_case columns matching the existing `Channel`/`User` convention.
+  - `size_bytes` typed `string | null` — TypeORM maps `bigint` to string to avoid >2^53 precision loss; the AC-4 test round-trips `'10737418240'`.
+  - `created_at`/`updated_at`/`processed_at` use `timestamptz` per the plan's Data Model (the phase-02 entities use plain `timestamp` via bare `@CreateDateColumn`, but the plan Data Model is authoritative and specifies timestamptz).
+  - Reciprocal `@OneToMany(() => Video, ...)` added to `Channel` (both sides per `.claude/rules/nestjs-entities.md`).
+  - Migration `1788745243630-CreateVideos.ts` generated via TypeORM CLI (not hand-written), applied cleanly; `down()` reverses FK → indexes → table → enum type. The existing `migrations.integration-spec.ts` asserts a hardcoded 2-migration list (`toHaveLength(2)`), so the new migration file does not affect it (out of scope, untouched).
+  - No `VideosModule` yet (not in SI-03.2 scope) — the entity is discovered by the data-source `src/**/*.entity.ts` glob for migration generation; module wiring comes in later SIs.
 
 ### SI-03.3 — StorageService (adapter S3/MinIO multipart + presign)
-- **Status:** pending
-- **Tests:** —
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 4 passing (`storage.service.integration-spec.ts` — real MinIO: multipart create→presign-part→PUT→complete→GET; abort; presignGet Range 206; presignDownload content-disposition; all assert URLs never contain `minio:9000`)
+- **Observations:**
+  - `StorageService` uses **two** `S3Client`s: a control-plane client on the internal endpoint (`minio:9000`) for create/complete/abort multipart, and a presigner client on the **public gateway host** so `getSignedUrl` signs the SigV4 `Host` to match what the browser hits. `getSignedUrl` signs locally (no network), so the presigner client needs no connectivity to the public host.
+  - Installed `@aws-sdk/client-s3@^3` + `@aws-sdk/s3-request-presigner@^3` (resolved `^3.1127.0`).
+  - `StorageModule` registered in `AppModule` (`storageConfig` was already global from SI-03.1).
+  - **Fixed a latent bug in SI-03.1's `gateway/Caddyfile` (surfaced, not silent).** It used `header_up Host {host}`, which strips the port; the SDK signs the `Host` as `<host>:9000` (9000 is non-standard), so MinIO recomputed a different signature → `SignatureDoesNotMatch` (403) on **every** presigned URL through the gateway. This would break production presigned URLs too (browser signs `localhost:9000`, gateway forwards `localhost`). Changed to `header_up Host {hostport}`; verified 200/206 through the gateway. SI-03.1 had no tests to catch this (infra-only); SI-03.3 is the first SI to exercise the presigned-URL contract end-to-end. Requires `docker compose restart storage-gateway` (or a fresh `up`) to reload Caddy.
+  - **Test masked-gateway note:** the spec signs against `storage-gateway:9000` (the Compose service name) instead of the prod `localhost:9000` — `localhost` inside the api container resolves to the container itself, whereas `storage-gateway:9000` is container-reachable AND SigV4-consistent (Caddy passes the `Host` through). Still satisfies AC #4 (never `minio:9000`).
 
 ### SI-03.4 — QueueModule (BullMQ + Redis)
 - **Status:** pending
