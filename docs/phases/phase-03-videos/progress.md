@@ -1,7 +1,7 @@
 # phase-03-videos — Progress
 
 **Status:** in_progress
-**SIs:** 3/10 completed
+**SIs:** 4/10 completed
 
 ### SI-03.1 — Infra: storage, fila e worker (Docker Compose + config)
 - **Status:** completed
@@ -41,9 +41,14 @@
   - **Test masked-gateway note:** the spec signs against `storage-gateway:9000` (the Compose service name) instead of the prod `localhost:9000` — `localhost` inside the api container resolves to the container itself, whereas `storage-gateway:9000` is container-reachable AND SigV4-consistent (Caddy passes the `Host` through). Still satisfies AC #4 (never `minio:9000`).
 
 ### SI-03.4 — QueueModule (BullMQ + Redis)
-- **Status:** pending
-- **Tests:** —
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 2 passing (`queue.module.spec.ts` — DI compiles; `video-processing` queue resolvable via `getQueueToken` for `@InjectQueue`)
+- **Observations:**
+  - `QueueModule` uses `BullModule.forRootAsync` (connection from `queue.config` → service name `redis`, injected via `queueConfig.KEY`) + `BullModule.registerQueue({ name: 'video-processing' })`, and re-exports `BullModule` so importers inherit the queue provider. Queue name centralized in `src/queue/queue.constants.ts` (`VIDEO_PROCESSING_QUEUE`), mirroring the `storage.constants.ts` precedent.
+  - **Dependency version pin — `@nestjs/bullmq@11.0.5` (not `^12`).** `npm install @nestjs/bullmq` resolved v12.0.0, which is ESM-only (`type: module`, `require` → the same ESM `dist/index.js`). The project's CommonJS Jest/ts-jest stack (default `transformIgnorePatterns: /node_modules/`) can't parse it → `SyntaxError: Unexpected token 'export'`; this would also break the whole e2e suite (AppModule → QueueModule). Pinned to `@nestjs/bullmq@11.0.5` (CJS, matches NestJS 11, peer-supports `bullmq@^6`) instead of doing ESM-transform surgery on both jest configs. Library-refs cited `bullmq` v5; installed `bullmq@^6.3.4` — the `forRootAsync`/`registerQueue`/`InjectQueue`/`WorkerHost` API used here is unchanged across v5→v6.
+  - **Installed `ioredis@^5.11.1` explicitly.** `bullmq@6` loads `ioredis` as an *optional* peer (`loadIORedis`); without it, `Queue` construction throws `BullMQ could not load the optional 'ioredis' package` at module-compile time.
+  - Module compilation test needs a **global** `ConfigModule` (loads `queueConfig`) for the `forRootAsync` factory's `inject: [queueConfig.KEY]` to resolve (per testing-guide gotcha), and `await moduleRef.close()` in `afterAll` to close the BullMQ/ioredis handle.
+  - tsc `--noEmit` = 0 after the dependency changes.
 
 ### SI-03.5 — Exceções de domínio de vídeo + guard de propriedade
 - **Status:** pending
