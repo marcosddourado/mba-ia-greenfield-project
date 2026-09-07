@@ -1,7 +1,7 @@
 # phase-03-videos — Progress
 
 **Status:** in_progress
-**SIs:** 4/10 completed
+**SIs:** 5/10 completed
 
 ### SI-03.1 — Infra: storage, fila e worker (Docker Compose + config)
 - **Status:** completed
@@ -51,9 +51,14 @@
   - tsc `--noEmit` = 0 after the dependency changes.
 
 ### SI-03.5 — Exceções de domínio de vídeo + guard de propriedade
-- **Status:** pending
-- **Tests:** —
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 3 passing (`video-owner.guard.spec.ts` — dono → allow; não-dono → `ForbiddenNotOwnerException`; `publicId` inexistente → `VideoNotFoundException`; mock repo via `getRepositoryToken(Video)`)
+- **Observations:**
+  - As 7 exceções de domínio ficam em um único arquivo `src/videos/exceptions/video.exceptions.ts`, todas estendendo o `DomainException` herdado (`src/common/exceptions/domain.exception.ts`) e mapeadas pelo Custom Domain Exception Filter da fase-02 → `{ statusCode, error, message }`. Códigos exatamente conforme o Error Catalog (`VIDEO_NOT_FOUND`/`FORBIDDEN_NOT_OWNER`/`UPLOAD_NOT_IN_PROGRESS`/`FILE_TOO_LARGE`/`UNSUPPORTED_MEDIA_TYPE`/`INVALID_PARTS`/`VIDEO_NOT_READY`).
+  - **Convenção de nome:** o plano cita as exceções em forma curta (`VideoNotFound`), mas segui o sufixo `...Exception` da fase-02 (`EmailAlreadyExistsException`, etc.) → classes nomeadas `VideoNotFoundException`, `ForbiddenNotOwnerException`, … (mesma identidade semântica; consistência com o código existente).
+  - `VideoOwnerGuard` resolve o vídeo por `public_id` com `relations: { channel: true }` e compara `video.channel.user_id` a `request.user.sub` (o `JwtPayload` da fase-02 usa `sub` como id do usuário, populado pelo `JwtAuthGuard` herdado). Lança `VideoNotFoundException` (existência oculta) antes de `ForbiddenNotOwnerException`.
+  - O guard consulta o repositório diretamente (design do plano), então tem lógica interna própria → o teste unitário com repo mockado é apropriado (a recomendação genérica do testing-guide de delegar a um service e testar via E2E não se aplica ao design deste SI). A cobertura E2E do guard vem quando ele for acoplado ao controller (SI-03.7).
+  - Ainda sem `VideosModule`/`TypeOrmModule.forFeature([Video])` (fora do escopo do SI-03.5); o guard é injetável mas só será registrado num módulo em SIs posteriores.
 
 ### SI-03.6 — VideosService: rascunho + orquestração de upload
 - **Status:** pending
