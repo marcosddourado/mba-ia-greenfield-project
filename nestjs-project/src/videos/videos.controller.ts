@@ -9,6 +9,7 @@ import {
   MessageEvent,
   Param,
   Post,
+  Redirect,
   Sse,
   UseGuards,
 } from '@nestjs/common';
@@ -238,6 +239,64 @@ export class VideosController {
     return from(this.videosService.getByPublicId(publicId, user.sub)).pipe(
       switchMap((video) => this.videosService.watchStatus(video)),
     );
+  }
+
+  @Public()
+  @Get(':publicId/stream')
+  @Redirect()
+  @ApiOperation({
+    summary: 'Stream a ready video (302 redirect)',
+    description:
+      'Resolves a Range-capable presigned GET URL on the masked gateway and 302-redirects to it, keeping the API out of the byte path. Anonymous; ready videos only.',
+  })
+  @ApiResponse({
+    status: 302,
+    description: 'Redirect to the presigned gateway stream URL',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'publicId does not resolve',
+    schema: { $ref: getSchemaPath(ApiErrorEnvelope) },
+  })
+  @ApiResponse({
+    status: 409,
+    description: 'Video is not ready',
+    schema: { $ref: getSchemaPath(ApiErrorEnvelope) },
+  })
+  async stream(
+    @Param('publicId') publicId: string,
+  ): Promise<{ url: string; statusCode: number }> {
+    const url = await this.videosService.getStreamUrl(publicId);
+    return { url, statusCode: HttpStatus.FOUND };
+  }
+
+  @Public()
+  @Get(':publicId/download')
+  @Redirect()
+  @ApiOperation({
+    summary: 'Download a ready video (302 redirect)',
+    description:
+      'Resolves a presigned GET URL carrying content-disposition: attachment and 302-redirects to it. Anonymous; ready videos only.',
+  })
+  @ApiResponse({
+    status: 302,
+    description: 'Redirect to the presigned gateway download URL',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'publicId does not resolve',
+    schema: { $ref: getSchemaPath(ApiErrorEnvelope) },
+  })
+  @ApiResponse({
+    status: 409,
+    description: 'Video is not ready',
+    schema: { $ref: getSchemaPath(ApiErrorEnvelope) },
+  })
+  async download(
+    @Param('publicId') publicId: string,
+  ): Promise<{ url: string; statusCode: number }> {
+    const url = await this.videosService.getDownloadUrl(publicId);
+    return { url, statusCode: HttpStatus.FOUND };
   }
 
   @Public()

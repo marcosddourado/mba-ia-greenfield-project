@@ -12,6 +12,7 @@ import {
   UnsupportedMediaTypeException,
   UploadNotInProgressException,
   VideoNotFoundException,
+  VideoNotReadyException,
 } from './exceptions/video.exceptions';
 import { VideosService } from './videos.service';
 
@@ -43,6 +44,8 @@ describe('VideosService (unit)', () => {
       | 'presignUploadPart'
       | 'completeMultipartUpload'
       | 'abortMultipartUpload'
+      | 'presignGet'
+      | 'presignDownload'
     >
   >;
   let queue: { add: jest.Mock };
@@ -58,6 +61,8 @@ describe('VideosService (unit)', () => {
       presignUploadPart: jest.fn().mockResolvedValue('https://gw/part'),
       completeMultipartUpload: jest.fn().mockResolvedValue(undefined),
       abortMultipartUpload: jest.fn().mockResolvedValue(undefined),
+      presignGet: jest.fn().mockResolvedValue('https://gw/stream'),
+      presignDownload: jest.fn().mockResolvedValue('https://gw/download'),
     };
     queue = { add: jest.fn().mockResolvedValue(undefined) };
 
@@ -277,6 +282,58 @@ describe('VideosService (unit)', () => {
       await expect(
         service.getByPublicId('missing', OWNER_ID),
       ).rejects.toBeInstanceOf(VideoNotFoundException);
+    });
+  });
+
+  describe('getStreamUrl / getDownloadUrl (delivery)', () => {
+    function videoInStatus(status: VideoStatus): Video {
+      return {
+        id: 'vid-1',
+        public_id: 'pub123',
+        status,
+        storage_key: 'videos/pub123/source',
+        original_filename: 'clip.mp4',
+      } as Video;
+    }
+
+    it('presigns a Range GET URL for a ready video (stream)', async () => {
+      repo.findOne.mockResolvedValue(videoInStatus(VideoStatus.READY));
+      const url = await service.getStreamUrl('pub123');
+      expect(url).toBe('https://gw/stream');
+      expect(storage.presignGet).toHaveBeenCalledWith('videos/pub123/source');
+    });
+
+    it('presigns an attachment GET URL for a ready video (download)', async () => {
+      repo.findOne.mockResolvedValue(videoInStatus(VideoStatus.READY));
+      const url = await service.getDownloadUrl('pub123');
+      expect(url).toBe('https://gw/download');
+      expect(storage.presignDownload).toHaveBeenCalledWith(
+        'videos/pub123/source',
+        'clip.mp4',
+      );
+    });
+
+    it('throws VIDEO_NOT_READY when streaming a non-ready video', async () => {
+      repo.findOne.mockResolvedValue(videoInStatus(VideoStatus.PROCESSING));
+      await expect(service.getStreamUrl('pub123')).rejects.toBeInstanceOf(
+        VideoNotReadyException,
+      );
+      expect(storage.presignGet).not.toHaveBeenCalled();
+    });
+
+    it('throws VIDEO_NOT_READY when downloading a non-ready video', async () => {
+      repo.findOne.mockResolvedValue(videoInStatus(VideoStatus.PROCESSING));
+      await expect(service.getDownloadUrl('pub123')).rejects.toBeInstanceOf(
+        VideoNotReadyException,
+      );
+      expect(storage.presignDownload).not.toHaveBeenCalled();
+    });
+
+    it('throws VIDEO_NOT_FOUND for an unknown publicId', async () => {
+      repo.findOne.mockResolvedValue(null);
+      await expect(service.getStreamUrl('missing')).rejects.toBeInstanceOf(
+        VideoNotFoundException,
+      );
     });
   });
 });

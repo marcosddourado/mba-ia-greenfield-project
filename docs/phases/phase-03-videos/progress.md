@@ -1,7 +1,7 @@
 # phase-03-videos — Progress
 
 **Status:** in_progress
-**SIs:** 8/10 completed
+**SIs:** 9/10 completed
 
 ### SI-03.1 — Infra: storage, fila e worker (Docker Compose + config)
 - **Status:** completed
@@ -109,9 +109,14 @@
     - **Menores:** a rota SSE refaz o `findOne` que o `VideoOwnerGuard` já carregou (stash `request.video` no guard); `OptionalJwtAuthGuard` repete ~3 linhas de extração de Bearer do `JwtAuthGuard` (extrair `extractBearerToken`); o logger de request do `main.ts` poderia virar um `NestMiddleware` nomeado.
 
 ### SI-03.9 — Streaming e download (delivery)
-- **Status:** pending
-- **Tests:** —
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 26 passing (21 unit `videos.service.spec.ts` — inclui o novo describe `getStreamUrl / getDownloadUrl (delivery)`: `ready` → URL presignada de stream/download; não-`ready` → `VIDEO_NOT_READY`; publicId inexistente → `VIDEO_NOT_FOUND`. 5 E2E em `test/videos-delivery.e2e-spec.ts` — spec-derived de `specs/videos-delivery.plan.md`: stream/download `ready` → 302 no host público do gateway; não-`ready` → 409; publicId inexistente → 404).
+- **Observations:**
+  - **Redirect 302 dinâmico:** endpoints `GET /videos/:publicId/stream` e `/download` usam `@Redirect()` (sem args) + retornam `{ url, statusCode: HttpStatus.FOUND }` para sobrescrever dinamicamente — padrão oficial NestJS 11 confirmado via context7 (`@Redirect(url, code)` com override por objeto `{ url, statusCode }`). API fora do caminho dos bytes: só assina a URL presignada e redireciona.
+  - **Delivery anônimo, `ready`-only:** ambos `@Public()` (sem `OptionalJwtAuthGuard` — não há visão de dono, `ready` é público a todos). Service ganhou `getStreamUrl`/`getDownloadUrl` + helper privado `getReadyVideo(publicId)`: `findOne` → `VideoNotFoundException` se ausente, `VideoNotReadyException` (409, já existia de SI-03.5) se `status !== ready`. `StorageService.presignGet`/`presignDownload` já existiam de SI-03.3 (nenhum método novo de storage necessário).
+  - **Ordem de rotas:** `:publicId/stream` e `:publicId/download` são caminhos de 2 segmentos, então não colidem com o `@Get(':publicId')` (1 segmento) — declarados antes dele por clareza.
+  - **Ajuste de asserção E2E (test autorado neste SI):** o spec pede "no response body" no stream 302; `@Redirect` (Express `res.redirect`) sempre popula o corpo default `"Found. Redirecting to …"`. A asserção `res.text === ''` foi trocada por `res.body === {}` (sem envelope de erro JSON) — o contrato real (302 + `Location` no gateway público, sem `minio:9000`) permanece assertado.
+  - context7 consultado para o padrão de redirect dinâmico do NestJS (não há `library-refs.md` nesta fase).
 
 ### SI-03.10 — Video worker: processor + entrypoint
 - **Status:** pending

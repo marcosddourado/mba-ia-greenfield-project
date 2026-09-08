@@ -26,6 +26,7 @@ import {
   UnsupportedMediaTypeException,
   UploadNotInProgressException,
   VideoNotFoundException,
+  VideoNotReadyException,
 } from './exceptions/video.exceptions';
 
 const PUBLIC_ID_COLUMN = 'public_id';
@@ -254,6 +255,43 @@ export class VideosService {
       video.status = VideoStatus.FAILED;
       await this.videoRepository.save(video);
     }
+  }
+
+  /**
+   * Resolves a presigned, Range-capable GET URL on the public gateway for a
+   * `ready` video and hands it back for a 302 redirect — keeping the API out of
+   * the byte path. Non-`ready` videos raise `VIDEO_NOT_READY`; unknown ids
+   * raise `VIDEO_NOT_FOUND`. Anonymous (no owner check): `ready` is public.
+   */
+  async getStreamUrl(publicId: string): Promise<string> {
+    const video = await this.getReadyVideo(publicId);
+    return this.storage.presignGet(video.storage_key);
+  }
+
+  /**
+   * Resolves a presigned GET URL forcing `content-disposition: attachment`
+   * (original filename) for a `ready` video, for a 302 download redirect.
+   * Same visibility rules as {@link getStreamUrl}.
+   */
+  async getDownloadUrl(publicId: string): Promise<string> {
+    const video = await this.getReadyVideo(publicId);
+    return this.storage.presignDownload(
+      video.storage_key,
+      video.original_filename,
+    );
+  }
+
+  private async getReadyVideo(publicId: string): Promise<Video> {
+    const video = await this.videoRepository.findOne({
+      where: { public_id: publicId },
+    });
+    if (!video) {
+      throw new VideoNotFoundException();
+    }
+    if (video.status !== VideoStatus.READY) {
+      throw new VideoNotReadyException();
+    }
+    return video;
   }
 
   /**
