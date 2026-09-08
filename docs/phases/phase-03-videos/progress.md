@@ -1,7 +1,7 @@
 # phase-03-videos — Progress
 
 **Status:** in_progress
-**SIs:** 6/10 completed
+**SIs:** 7/10 completed
 
 ### SI-03.1 — Infra: storage, fila e worker (Docker Compose + config)
 - **Status:** completed
@@ -80,9 +80,16 @@
   - **Follow-up (fora de escopo):** `ALL_ENTITIES` está duplicado em ~11 specs — um `src/test/entities.ts` compartilhado evitaria recorrência desta classe de bug. Igualmente, o fixture `createChannel` está duplicado entre specs. Não aplicado agora (churn amplo em arquivos commitados).
 
 ### SI-03.7 — Controller de upload + DTOs (HTTP wiring)
-- **Status:** pending
-- **Tests:** —
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 7 passing (E2E `test/videos-upload.e2e-spec.ts` — 4× `POST /videos`: draft+multipart-init, FILE_TOO_LARGE, UNSUPPORTED_MEDIA_TYPE, 401 unauth; 3× handshake: presign contra o gateway público, owner complete→processing+enqueue, complete por não-dono→403 FORBIDDEN_NOT_OWNER). Suíte e2e completa verde: 4 suites/59.
+- **Observations:**
+  - **Guards:** JWT auth é global (`APP_GUARD`, per `nestjs-controllers.md`), então o controller não aplica `@UseGuards(JwtAuthGuard)`; as 3 rotas por-vídeo adicionam `@UseGuards(VideoOwnerGuard)` (registrado como provider no `VideosModule` para o DI resolver o `@InjectRepository(Video)`). Ordem: global JwtAuthGuard (401 + popula `request.user`) → VideoOwnerGuard (404 antes de 403) → service (409/400).
+  - **DTOs deliberadamente permissivos:** `create-video.dto.ts` valida presença/tipo/tamanho de string, mas NÃO impõe o allowlist `video/*` nem o teto de 10 GB — essas são regras de domínio no service que produzem os códigos do Error Catalog (`UNSUPPORTED_MEDIA_TYPE` 415, `FILE_TOO_LARGE` 400). Um `@Matches`/`@Max` no DTO daria um 400 genérico de validação e mascararia o código específico exigido pelas ACs. `part-urls.dto.ts` e `complete-upload.dto.ts` (com `@ValidateNested`+`@Type` no array de parts) impõem as bordas 1..10000.
+  - **Resolução de canal (SRP):** o `createDraft` recebe `channelId`; o controller resolve o canal do usuário autenticado via novo `ChannelsService.findByUserId(userId)` (o domínio de canal é dono da própria consulta — não vazei o repositório de Channel para dentro de videos). `VideosModule` passou a importar `ChannelsModule` (que já exporta `ChannelsService`). Sem teste dedicado para o read de uma linha — coberto transitivamente pelo E2E (o `channel_id` do draft é asseverado contra o canal semeado).
+  - **Swagger:** `@ApiTags('videos')` + `@ApiBearerAuth('access-token')` na classe; cada rota com `@ApiOperation` + um `@ApiResponse` por status previsível referenciando `ApiErrorEnvelope` via `getSchemaPath`; sucessos tipados com response DTOs (`CreateVideoResponseDto`, `PartUrlsResponseDto`, `CompleteUploadResponseDto`). Plugin `@nestjs/swagger` (classValidatorShim) infere `@ApiProperty` dos request DTOs.
+  - **Fidelidade do E2E:** presigner apontado para `storage-gateway:9000` via `process.env.STORAGE_PUBLIC_HOST` antes do bootstrap (mesmo padrão do `storage.service.integration-spec.ts`; `localhost:9000` resolveria para o próprio container). O cenário `complete` faz um upload real de 1 parte (presign → PUT no gateway → ETag genuíno) porque o `"etag-1"` literal do spec seria rejeitado pelo MinIO real. O enfileiramento é asseverado com `jest.spyOn(queue, 'add')` — determinístico frente ao container `video-worker` em execução, que de outro modo drenaria `queue.getWaiting()`.
+  - **Reparo de baseline (infra de teste):** `npm run test:e2e` rodava as suites em paralelo (script sem `--runInBand`, `jest-e2e.json` sem `maxWorkers`). Latente enquanto só `auth` truncava o DB compartilhado; ao adicionar uma 2ª suite e2e que também trunca `users`/`channels` (videos-upload), surgiu contaminação de FK (usuários deletados no meio do voo → falhas em auth E videos). **Fix:** `"maxWorkers": 1` em `test/jest-e2e.json`, gravando o mandato "e2e serial no DB compartilhado" (CLAUDE.md) no nível de config — qualquer invocação (script, IDE, CI) roda serial. Suíte completa depois: e2e 4/59, unit+integration 29/170, `tsc` 0, `lint` 0 erros (41 warnings pré-existentes + 1 `no-unsafe-argument` no novo e2e).
+  - **Flow ao vivo verificado** contra o app em execução: register → token do Mailpit → confirm → login → `POST /videos` (draft) → part-urls (host `localhost:9000` = gateway público, nunca `minio:9000`) → PUT da parte → complete = `processing`.
 
 ### SI-03.8 — Leitura do vídeo + status SSE
 - **Status:** pending

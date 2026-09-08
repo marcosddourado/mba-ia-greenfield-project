@@ -11,6 +11,13 @@ const MAX_RETRIES = 5;
 export class ChannelsService {
   constructor(private readonly dataSource: DataSource) {}
 
+  /** Resolves the channel owned by a user, or `null` if none exists. */
+  async findByUserId(userId: string): Promise<Channel | null> {
+    return this.dataSource
+      .getRepository(Channel)
+      .findOne({ where: { user_id: userId } });
+  }
+
   async createChannel(userId: string, email: string): Promise<Channel> {
     const baseNickname = sanitizeNickname(email.split('@')[0]);
 
