@@ -2,6 +2,7 @@ import { getQueueToken } from '@nestjs/bullmq';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { QueryFailedError } from 'typeorm';
+import queueConfig from '../config/queue.config';
 import { StorageService } from '../storage/storage.service';
 import { VIDEO_PROCESSING_QUEUE } from '../queue/queue.constants';
 import { Video, VideoStatus } from './entities/video.entity';
@@ -66,6 +67,7 @@ describe('VideosService (unit)', () => {
         { provide: getRepositoryToken(Video), useValue: repo },
         { provide: StorageService, useValue: storage },
         { provide: getQueueToken(VIDEO_PROCESSING_QUEUE), useValue: queue },
+        { provide: queueConfig.KEY, useValue: { host: 'redis', port: 6379 } },
       ],
     }).compile();
 
@@ -223,6 +225,58 @@ describe('VideosService (unit)', () => {
       await expect(service.abortUpload('missing')).rejects.toBeInstanceOf(
         VideoNotFoundException,
       );
+    });
+  });
+
+  describe('getByPublicId (visibility)', () => {
+    const OWNER_ID = 'user-owner';
+
+    function videoInStatus(status: VideoStatus): Video {
+      return {
+        id: 'vid-1',
+        public_id: 'pub123',
+        status,
+        channel: { user_id: OWNER_ID },
+      } as Video;
+    }
+
+    it('returns a ready video to an anonymous caller', async () => {
+      repo.findOne.mockResolvedValue(videoInStatus(VideoStatus.READY));
+      const video = await service.getByPublicId('pub123');
+      expect(video.status).toBe(VideoStatus.READY);
+    });
+
+    it('hides a processing video from an anonymous caller (VIDEO_NOT_FOUND)', async () => {
+      repo.findOne.mockResolvedValue(videoInStatus(VideoStatus.PROCESSING));
+      await expect(service.getByPublicId('pub123')).rejects.toBeInstanceOf(
+        VideoNotFoundException,
+      );
+    });
+
+    it('hides a processing video from an authenticated non-owner (VIDEO_NOT_FOUND)', async () => {
+      repo.findOne.mockResolvedValue(videoInStatus(VideoStatus.PROCESSING));
+      await expect(
+        service.getByPublicId('pub123', 'someone-else'),
+      ).rejects.toBeInstanceOf(VideoNotFoundException);
+    });
+
+    it('returns a processing/draft/failed video to its owner', async () => {
+      for (const status of [
+        VideoStatus.DRAFT,
+        VideoStatus.PROCESSING,
+        VideoStatus.FAILED,
+      ]) {
+        repo.findOne.mockResolvedValue(videoInStatus(status));
+        const video = await service.getByPublicId('pub123', OWNER_ID);
+        expect(video.status).toBe(status);
+      }
+    });
+
+    it('throws VIDEO_NOT_FOUND for an unknown publicId', async () => {
+      repo.findOne.mockResolvedValue(null);
+      await expect(
+        service.getByPublicId('missing', OWNER_ID),
+      ).rejects.toBeInstanceOf(VideoNotFoundException);
     });
   });
 });

@@ -2,11 +2,14 @@ import {
   Body,
   Controller,
   Delete,
+  Get,
   HttpCode,
   HttpStatus,
   InternalServerErrorException,
+  MessageEvent,
   Param,
   Post,
+  Sse,
   UseGuards,
 } from '@nestjs/common';
 import {
@@ -16,8 +19,11 @@ import {
   ApiTags,
   getSchemaPath,
 } from '@nestjs/swagger';
+import { from, Observable, switchMap } from 'rxjs';
 import type { JwtPayload } from '../auth/auth.types';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
+import { Public } from '../auth/decorators/public.decorator';
+import { OptionalJwtAuthGuard } from '../auth/guards/optional-jwt-auth.guard';
 import { ChannelsService } from '../channels/channels.service';
 import { ApiErrorEnvelope } from '../common/openapi/api-error-envelope.dto';
 import { CreateVideoDto, CreateVideoResponseDto } from './dto/create-video.dto';
@@ -26,6 +32,7 @@ import {
   CompleteUploadResponseDto,
 } from './dto/complete-upload.dto';
 import { PartUrlsDto, PartUrlsResponseDto } from './dto/part-urls.dto';
+import { VideoResponseDto } from './dto/video-response.dto';
 import { VideoOwnerGuard } from './guards/video-owner.guard';
 import { VideosService } from './videos.service';
 
@@ -196,5 +203,66 @@ export class VideosController {
   })
   async abortUpload(@Param('publicId') publicId: string): Promise<void> {
     await this.videosService.abortUpload(publicId);
+  }
+
+  @Sse(':publicId/status')
+  @UseGuards(VideoOwnerGuard)
+  @ApiOperation({
+    summary: 'Live processing status (SSE)',
+    description:
+      'Owner-only Server-Sent Events channel emitting { status, progress } while the video is processing; the stream closes when the video reaches ready/failed or the client disconnects.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'text/event-stream of { status, progress } events',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Missing or invalid access token',
+    schema: { $ref: getSchemaPath(ApiErrorEnvelope) },
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Authenticated user does not own the video’s channel',
+    schema: { $ref: getSchemaPath(ApiErrorEnvelope) },
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'publicId does not resolve',
+    schema: { $ref: getSchemaPath(ApiErrorEnvelope) },
+  })
+  status(
+    @Param('publicId') publicId: string,
+    @CurrentUser() user: JwtPayload,
+  ): Observable<MessageEvent> {
+    return from(this.videosService.getByPublicId(publicId, user.sub)).pipe(
+      switchMap((video) => this.videosService.watchStatus(video)),
+    );
+  }
+
+  @Public()
+  @UseGuards(OptionalJwtAuthGuard)
+  @Get(':publicId')
+  @ApiOperation({
+    summary: 'Get a video by its public id',
+    description:
+      'Returns the public video DTO. Anonymous/non-owner callers see only ready videos; the owner sees any status. A non-ready video requested by a non-owner returns 404 (existence hidden).',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Video DTO',
+    type: VideoResponseDto,
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'publicId does not resolve, or a hidden non-ready video',
+    schema: { $ref: getSchemaPath(ApiErrorEnvelope) },
+  })
+  async getOne(
+    @Param('publicId') publicId: string,
+    @CurrentUser() user: JwtPayload | undefined,
+  ): Promise<VideoResponseDto> {
+    const video = await this.videosService.getByPublicId(publicId, user?.sub);
+    return this.videosService.toResponseDto(video);
   }
 }

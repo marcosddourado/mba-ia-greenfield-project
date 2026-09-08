@@ -1,13 +1,17 @@
 import { InjectQueue } from '@nestjs/bullmq';
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, MessageEvent } from '@nestjs/common';
+import type { ConfigType } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Queue } from 'bullmq';
+import { Queue, QueueEvents } from 'bullmq';
 import { customAlphabet } from 'nanoid';
+import { Observable } from 'rxjs';
 import { Repository } from 'typeorm';
 import { isPgUniqueViolationOnColumn } from '../common/database/pg-errors';
+import queueConfig from '../config/queue.config';
 import { PRESIGN_EXPIRES_IN_SECONDS } from '../storage/storage.constants';
 import { StorageService, type CompletedPart } from '../storage/storage.service';
 import { VIDEO_PROCESSING_QUEUE } from '../queue/queue.constants';
+import { VideoResponseDto } from './dto/video-response.dto';
 import { Video, VideoStatus } from './entities/video.entity';
 import {
   MAX_FILE_SIZE_BYTES,
@@ -75,6 +79,8 @@ export class VideosService {
     private readonly storage: StorageService,
     @InjectQueue(VIDEO_PROCESSING_QUEUE)
     private readonly queue: Queue,
+    @Inject(queueConfig.KEY)
+    private readonly queueCfg: ConfigType<typeof queueConfig>,
   ) {}
 
   /** Generates a candidate `public_id`. Isolated so tests can force a collision. */
@@ -248,6 +254,126 @@ export class VideosService {
       video.status = VideoStatus.FAILED;
       await this.videoRepository.save(video);
     }
+  }
+
+  /**
+   * Resolves a video by `public_id` applying visibility rules: anonymous and
+   * non-owner callers see only `ready` videos; the owner sees any status. A
+   * non-`ready` video requested by a non-owner is reported as `VIDEO_NOT_FOUND`
+   * (existence is hidden rather than exposed via 403).
+   */
+  async getByPublicId(
+    publicId: string,
+    requesterUserId?: string,
+  ): Promise<Video> {
+    const video = await this.videoRepository.findOne({
+      where: { public_id: publicId },
+      relations: { channel: true },
+    });
+    if (!video) {
+      throw new VideoNotFoundException();
+    }
+
+    const isOwner =
+      !!requesterUserId && video.channel.user_id === requesterUserId;
+    if (video.status !== VideoStatus.READY && !isOwner) {
+      throw new VideoNotFoundException();
+    }
+
+    return video;
+  }
+
+  /** Maps a video to its public DTO, presigning the thumbnail URL if present. */
+  async toResponseDto(video: Video): Promise<VideoResponseDto> {
+    const thumbnailUrl = video.thumbnail_key
+      ? await this.storage.presignGet(video.thumbnail_key)
+      : null;
+
+    return {
+      publicId: video.public_id,
+      title: video.title,
+      status: video.status,
+      // Live progress is delivered via the SSE status channel; the one-shot DTO
+      // reports the durable value (null until a processed value is persisted).
+      progress: null,
+      durationSeconds: video.duration_seconds,
+      metadata: video.metadata,
+      thumbnailUrl,
+      createdAt: video.created_at.toISOString(),
+    };
+  }
+
+  /**
+   * Live status channel for a processing video. Emits the current status
+   * immediately, then bridges BullMQ `QueueEvents` (progress/completed/failed)
+   * for this video's job into `{ status, progress }` events, completing the
+   * stream once the video reaches a terminal state. The `QueueEvents`
+   * connection is closed when the client disconnects (Observable teardown).
+   */
+  watchStatus(video: Video): Observable<MessageEvent> {
+    const videoId = video.id;
+
+    return new Observable<MessageEvent>((subscriber) => {
+      subscriber.next({ data: { status: video.status, progress: null } });
+
+      if (
+        video.status === VideoStatus.READY ||
+        video.status === VideoStatus.FAILED
+      ) {
+        subscriber.complete();
+        return;
+      }
+
+      const queueEvents = new QueueEvents(VIDEO_PROCESSING_QUEUE, {
+        connection: {
+          host: this.queueCfg.host,
+          port: this.queueCfg.port,
+        },
+      });
+
+      const belongsToVideo = async (jobId: string): Promise<boolean> => {
+        const job = await this.queue.getJob(jobId);
+        // BullMQ types `Job.data` as `any`; narrow to the known payload shape.
+        const data = job?.data as { videoId?: string } | undefined;
+        return data?.videoId === videoId;
+      };
+
+      queueEvents.on('progress', ({ jobId, data }) => {
+        void belongsToVideo(jobId).then((match) => {
+          if (match) {
+            subscriber.next({
+              data: { status: VideoStatus.PROCESSING, progress: data },
+            });
+          }
+        });
+      });
+
+      queueEvents.on('completed', ({ jobId }) => {
+        void belongsToVideo(jobId).then((match) => {
+          if (match) {
+            subscriber.next({
+              data: { status: VideoStatus.READY, progress: 100 },
+            });
+            subscriber.complete();
+          }
+        });
+      });
+
+      queueEvents.on('failed', ({ jobId }) => {
+        void belongsToVideo(jobId).then((match) => {
+          if (match) {
+            subscriber.next({
+              data: { status: VideoStatus.FAILED, progress: null },
+            });
+            subscriber.complete();
+          }
+        });
+      });
+
+      return () => {
+        void queueEvents.close();
+      };
+    });
   }
 
   private async getUploadableVideo(

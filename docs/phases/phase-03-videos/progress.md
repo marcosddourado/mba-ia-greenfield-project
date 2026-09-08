@@ -1,7 +1,7 @@
 # phase-03-videos — Progress
 
 **Status:** in_progress
-**SIs:** 7/10 completed
+**SIs:** 8/10 completed
 
 ### SI-03.1 — Infra: storage, fila e worker (Docker Compose + config)
 - **Status:** completed
@@ -92,9 +92,21 @@
   - **Flow ao vivo verificado** contra o app em execução: register → token do Mailpit → confirm → login → `POST /videos` (draft) → part-urls (host `localhost:9000` = gateway público, nunca `minio:9000`) → PUT da parte → complete = `processing`.
 
 ### SI-03.8 — Leitura do vídeo + status SSE
-- **Status:** pending
-- **Tests:** —
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 8 passing (5 unit `videos.service.spec.ts` → describe `getByPublicId (visibility)`: anônimo vê `ready`; anônimo/não-dono vê `processing` → 404; dono vê draft/processing/failed; 404 em publicId inexistente. 3 E2E de leitura + 3 E2E de SSE em `test/videos-read.e2e-spec.ts`). Suíte completa verde: unit+integration 29/175, e2e 5/65.
+- **Observations:**
+  - **Auth opcional (`GET /videos/:publicId`):** anônimo é permitido, mas o dono vê mais. Como o `JwtAuthGuard` global daria 401 em request sem token, a rota é `@Public()` + `@UseGuards(OptionalJwtAuthGuard)` — novo guard em `src/auth/guards/` (espelha o `JwtAuthGuard` custom, mas nunca lança: popula `request.user` se houver Bearer válido, senão segue anônimo). Provido/exportado pelo `AuthModule`; `VideosModule` passou a importar `AuthModule`. Regra de visibilidade no service (`getByPublicId`): não-`ready` pedido por não-dono → `VideoNotFoundException` (existência escondida, 404, não 403).
+  - **SSE (`@Sse(':publicId/status')`):** owner-only (`VideoOwnerGuard`; sem token → 401 pelo guard global). Handler retorna `Observable<MessageEvent>` via `from(getByPublicId).pipe(switchMap(watchStatus))`. `watchStatus` emite o status atual imediatamente, então faz bridge de `QueueEvents` (BullMQ: `progress`/`completed`/`failed`) para `{ status, progress }`, completando o stream em `ready`/`failed`; `finalize`/teardown fecha a conexão `QueueEvents` no disconnect do cliente. Correlação evento→vídeo por `queue.getJob(jobId).data.videoId` (o plano não persiste jobId). context7 consultado para as APIs de `QueueEvents` e `@Sse` (não há `library-refs.md`).
+  - **`progress` no DTO one-shot é `null`** — o valor ao vivo vem pelo canal SSE; o `GET` é o fallback durável (o plano tolera "number or null"). Correlacionar progress→job no one-shot exigiria varrer a fila (jobId não persistido) — fora de escopo.
+  - **DTO de resposta** (`video-response.dto.ts`) com `@ApiProperty` explícito (response shape, sem class-validator para o plugin inferir): expõe `publicId,title,status,progress,durationSeconds,metadata,thumbnailUrl,createdAt`; `thumbnailUrl` é presign de `thumbnail_key` (ou `null`). Nunca expõe `id`/`storage_key`/`channel_id` (asseverado no E2E).
+  - **Fidelidade do E2E de SSE:** o teste "closes on terminal" usa um vídeo semeado em `ready` — exercita o ramo de fechamento do stream de forma **determinística**, sem depender do worker (SI-03.10 ainda não existe) nem competir com o container `video-worker` em execução por um job real. O teste de streaming usa `app.listen(0)` + `fetch` com leitor de `ReadableStream` (supertest não lida bem com streaming). Teardown com espera curta fecha a conexão ioredis do `QueueEvents` sem "Jest did not exit".
+  - **lint:** `job.data` é `any` na tipagem do BullMQ → narrow para `{ videoId?: string }` evita o erro `no-unsafe-member-access`. tsc 0, lint 0 erros (42 warnings pré-existentes).
+  - **Flow ao vivo verificado** com vídeo real: owner GET (processing)→200; anon GET→404; SSE owner→evento inicial `{status:processing,progress:null}`; SSE sem token→401; após simular o worker (`UPDATE videos SET status='ready'`) anon GET→200 com `thumbnailUrl` presignado em `localhost:9000`. Um vídeo só fica `ready` quando o worker (SI-03.10) processar — até lá permanece `processing`.
+  - **Follow-ups do `/simplify` (fora de escopo agora, sem fix aplicado — todos exigem tocar arquivos commitados, mudar comportamento, ou dependem do produtor SI-03.10):**
+    - **Correlação do `watchStatus` (eficiência + dedup):** hoje faz `queue.getJob(jobId)` por evento de `progress` para casar `data.videoId`. Quando o worker (produtor) existir em SI-03.10, enfileirar em `completeUpload` com `{ jobId: video.id }` e correlacionar por igualdade `jobId === video.id` (zero I/O por evento), o que também colapsa os 3 handlers `progress/completed/failed`. Não feito agora porque muda a assinatura do `queue.add` (dedup de job) e quebra asserções commitadas de SI-03.6/03.7.
+    - **Altitude do `QueueEvents`:** o service remonta a conexão Redis via `@Inject(queueConfig.KEY)` (`{host,port}`) em vez de consumir a infra do `QueueModule`. Introduzir um provider/factory de `QueueEvents` no `QueueModule` junto do SI-03.10 (o worker precisa da mesma infra) e remover a injeção de `queueConfig` do `VideosService` (elimina também os 2 patches de test-setup).
+    - **Helpers de e2e triplicados:** `registerConfirmAndLogin`/`captureConfirmationToken`/`channelIdForEmail` + bootstrap estão copiados em `auth.e2e`, `videos-upload.e2e` e `videos-read.e2e`. Extrair para `src/test/e2e-auth.ts` (refactor cross-arquivo tocando specs commitados — mesmo follow-up já anotado em SI-03.6).
+    - **Menores:** a rota SSE refaz o `findOne` que o `VideoOwnerGuard` já carregou (stash `request.video` no guard); `OptionalJwtAuthGuard` repete ~3 linhas de extração de Bearer do `JwtAuthGuard` (extrair `extractBearerToken`); o logger de request do `main.ts` poderia virar um `NestMiddleware` nomeado.
 
 ### SI-03.9 — Streaming e download (delivery)
 - **Status:** pending

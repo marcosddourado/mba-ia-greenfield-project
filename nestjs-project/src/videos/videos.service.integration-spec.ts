@@ -35,7 +35,10 @@ describe('VideosService (integration)', () => {
     videoRepository = dataSource.getRepository(Video);
     channelRepository = dataSource.getRepository(Channel);
     userRepository = dataSource.getRepository(User);
-    service = new VideosService(videoRepository, stubStorage, stubQueue);
+    service = new VideosService(videoRepository, stubStorage, stubQueue, {
+      host: 'redis',
+      port: 6379,
+    });
   });
 
   afterAll(async () => {

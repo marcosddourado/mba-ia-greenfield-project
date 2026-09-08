@@ -3,6 +3,9 @@
 /node_modules
 /build
 
+# local REST Client (.http) scratch files — not part of the repo
+/http
+
 # Logs
 logs
 *.log
