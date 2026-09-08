@@ -21,11 +21,7 @@ export class ForbiddenNotOwnerException extends DomainException {
 
 export class UploadNotInProgressException extends DomainException {
   constructor() {
-    super(
-      'UPLOAD_NOT_IN_PROGRESS',
-      409,
-      'The video has no upload in progress',
-    );
+    super('UPLOAD_NOT_IN_PROGRESS', 409, 'The video has no upload in progress');
   }
 }
 

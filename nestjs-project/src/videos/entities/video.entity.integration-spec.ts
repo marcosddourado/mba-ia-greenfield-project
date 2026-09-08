@@ -1,7 +1,10 @@
 import { DataSource, Repository } from 'typeorm';
 import { User } from '../../users/entities/user.entity';
 import { Channel } from '../../channels/entities/channel.entity';
-import { createTestDataSource } from '../../test/create-test-data-source';
+import {
+  cleanAllTables,
+  createTestDataSource,
+} from '../../test/create-test-data-source';
 import { Video, VideoStatus } from './video.entity';
 
 const ALL_ENTITIES = [User, Channel, Video];
@@ -25,10 +28,9 @@ describe('Video entity (integration)', () => {
   });
 
   beforeEach(async () => {
-    // videos is a child of channels — clear it before the parents.
-    await dataSource.query('DELETE FROM "videos"');
-    await dataSource.query('DELETE FROM "channels"');
-    await dataSource.query('DELETE FROM "users"');
+    // Shared helper clears videos + tokens before channels/users in FK order —
+    // other suites (auth) leave token rows that would block a bare users DELETE.
+    await cleanAllTables(dataSource);
   });
 
   async function createChannel(): Promise<Channel> {

@@ -1,7 +1,7 @@
 # phase-03-videos — Progress
 
 **Status:** in_progress
-**SIs:** 5/10 completed
+**SIs:** 6/10 completed
 
 ### SI-03.1 — Infra: storage, fila e worker (Docker Compose + config)
 - **Status:** completed
@@ -61,9 +61,23 @@
   - Ainda sem `VideosModule`/`TypeOrmModule.forFeature([Video])` (fora do escopo do SI-03.5); o guard é injetável mas só será registrado num módulo em SIs posteriores.
 
 ### SI-03.6 — VideosService: rascunho + orquestração de upload
-- **Status:** pending
-- **Tests:** —
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 13 passing (11 unit `videos.service.spec.ts` — createDraft happy/retry/415/400, completeUpload processing+enqueue/404/409/INVALID_PARTS, abortUpload failed/idempotente/404; 2 integration `videos.service.integration-spec.ts` — persistência do rascunho + colisão de `public_id` resolvida contra o índice único real)
+- **Observations:**
+  - `createDraft(channelId, input)` recebe o `channelId` explicitamente — a resolução canal↔usuário é responsabilidade do controller (SI-03.7). Isso mantém `VideosModule` importando exatamente o que o SI lista (`TypeOrmModule.forFeature([Video])`, `StorageModule`, `QueueModule`), sem `ChannelsModule` (SRP: o service de vídeo não consulta canais).
+  - `public_id` via `nanoid@^3` `customAlphabet` (11 chars, alfabeto URL-safe do TD-05; instalado v3 porque v4 é ESM-only e quebraria o stack CJS). Retry em colisão captura `QueryFailedError` code `23505` com `detail` contendo `public_id` (mesmo helper que `channels.service.ts`), sem transação (insert de entidade única → não precisa de SAVEPOINT). `generatePublicId()` é método próprio para permitir forçar colisão no teste de integração via `jest.spyOn`.
+  - Validações de domínio em `createDraft`: `contentType` deve começar com `video/` (senão `UnsupportedMediaTypeException` 415); `sizeBytes` ≤ 10 GB (senão `FileTooLargeException` 400). Estas produzem os códigos do Error Catalog — o `ValidationPipe`/class-validator do DTO (SI-03.7) só daria 400 genérico.
+  - `completeUpload` mapeia `{ partNumber, eTag }` → `CompletedPart { PartNumber, ETag }`, chama `storage.completeMultipartUpload` (falha → `InvalidPartsException`), transiciona para `processing`, limpa `upload_id` e enfileira **exatamente um** job `process` com `{ videoId: video.id }` (id interno, não `public_id`, conforme payload dos Events/Messages). `abortUpload` é idempotente: só chama o storage se houver `upload_id`; segunda chamada (já `failed`) é no-op.
+  - `size_bytes` persistido como string (`bigint` do TypeORM); `storage_key` = `videos/{publicId}/source`. `issuePartUrls` transiciona `draft→uploading` na primeira emissão (intenção do Data Model) e devolve `expiresAt` derivado de `PRESIGN_EXPIRES_IN_SECONDS`.
+  - **tsc gotcha:** tipar o mock do repositório como `jest.Mocked<Pick<Repository, 'create'|'save'>>` colide com as overloads do TypeORM sob `tsc --noEmit` (os testes passam no ts-jest, mas o type-check do projeto falha). Troquei por um triplo `jest.Mock` simples injetado via `getRepositoryToken` → tsc = 0.
+  - `VideosModule` criado mas a validação de DI cross-módulo (fila `video-processing` exportada via `QueueModule → exports: [BullModule]`) só é exercida quando o controller/e2e do SI-03.7 subir o módulo; os testes deste SI constroem o `VideosService` diretamente. tsc limpo.
+  - **`/simplify` (cleanup pós-SI-03.6) + regressões pré-existentes descobertas.** A limpeza do diff aplicou: extração do helper `isPgUniqueViolationOnColumn` duplicado para `src/common/database/pg-errors.ts` (reusado por `ChannelsService` e `VideosService`); simplificação do loop de retry (`for(;;)`, sem `throw` inalcançável); estreitamento do retorno de `getUploadableVideo` (remoção de 4 casts `as string`); Set de 2 estados → disjunção inline. Rodar a suíte completa (que o `/simplify` provocou) revelou que **o baseline commitado da fase-03 estava vermelho na suíte completa** — regressões que o loop per-SI não pegou porque só roda os testes do próprio SI:
+    - **SI-03.2 (relação `Channel@OneToMany(Video)`):** ~11 DataSources de teste (auth/users/channels/videos/migrations) listavam `Channel` sem `Video` → `Entity metadata for Channel#videos was not found` no `initialize()`. **Fix:** adicionado `Video` a todas as listas de entidades de teste que incluem `Channel`.
+    - **SI-03.2 (ordem de FK no cleanup):** `cleanAllTables` não deletava `videos` antes de `channels`. **Fix:** adicionado `DELETE FROM "videos"` no topo (reverse-FK, conforme testing-guide gotchas); os specs de vídeo passaram a usar `cleanAllTables` (limpa tokens também, evitando FK `users`←`verification_tokens`).
+    - **SI-03.2 + SI-03.4 (bootstrap real da aplicação):** `AppModule` (com `autoLoadEntities: true`) carregava `Channel` mas não `Video` (o `VideosModule` não estava importado) → **a aplicação não subia** desde a SI-03.2 (quebrava `NestFactory.create`, todo o e2e e o `openapi-export`, mascarado por `logger:false` → `process.exit(1)`). **Fix:** `VideosModule` importado no `AppModule` (o que a SI-03.7 faria de qualquer forma; sem controller ainda). Verificado `BOOT OK`.
+    - **Estado sujo do DB compartilhado:** linha órfã em `videos` acumulada nas corridas de debug bloqueava a criação do FK no `synchronize`; limpa uma vez.
+  - **Baseline final verde:** `npm test -- --runInBand` 29 suites/170 testes, `npm run test:e2e` 3 suites/52 testes, `tsc --noEmit` 0, `npm run lint` 0 erros (40 warnings pré-existentes). `AppModule` sobe.
+  - **Follow-up (fora de escopo):** `ALL_ENTITIES` está duplicado em ~11 specs — um `src/test/entities.ts` compartilhado evitaria recorrência desta classe de bug. Igualmente, o fixture `createChannel` está duplicado entre specs. Não aplicado agora (churn amplo em arquivos commitados).
 
 ### SI-03.7 — Controller de upload + DTOs (HTTP wiring)
 - **Status:** pending
