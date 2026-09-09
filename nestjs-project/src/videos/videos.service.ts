@@ -11,6 +11,7 @@ import queueConfig from '../config/queue.config';
 import { PRESIGN_EXPIRES_IN_SECONDS } from '../storage/storage.constants';
 import { StorageService, type CompletedPart } from '../storage/storage.service';
 import { VIDEO_PROCESSING_QUEUE } from '../queue/queue.constants';
+import { sourceKeyFor } from './video-storage-keys';
 import { VideoResponseDto } from './dto/video-response.dto';
 import { Video, VideoStatus } from './entities/video.entity';
 import {
@@ -89,10 +90,6 @@ export class VideosService {
     return this.generateSlug();
   }
 
-  private static storageKeyFor(publicId: string): string {
-    return `videos/${publicId}/source`;
-  }
-
   /**
    * Pre-registers a draft video and opens the multipart upload. Retries on the
    * rare `public_id` collision so the caller never sees a conflict error.
@@ -109,7 +106,7 @@ export class VideosService {
     }
 
     const video = await this.persistDraftWithUniquePublicId(channelId, input);
-    const storageKey = VideosService.storageKeyFor(video.public_id);
+    const storageKey = sourceKeyFor(video.public_id);
 
     const uploadId = await this.storage.createMultipartUpload(
       storageKey,
@@ -146,7 +143,7 @@ export class VideosService {
         content_type: input.contentType,
         size_bytes: input.sizeBytes.toString(),
         status: VideoStatus.DRAFT,
-        storage_key: VideosService.storageKeyFor(publicId),
+        storage_key: sourceKeyFor(publicId),
       });
 
       try {
@@ -277,21 +274,25 @@ export class VideosService {
     const video = await this.getReadyVideo(publicId);
     return this.storage.presignDownload(
       video.storage_key,
-      video.original_filename,
+      video.original_filename ?? `${video.public_id}.mp4`,
     );
   }
 
-  private async getReadyVideo(publicId: string): Promise<Video> {
+  private async getReadyVideo(
+    publicId: string,
+  ): Promise<Video & { storage_key: string }> {
     const video = await this.videoRepository.findOne({
       where: { public_id: publicId },
     });
     if (!video) {
       throw new VideoNotFoundException();
     }
-    if (video.status !== VideoStatus.READY) {
+    // A `ready` video always carries a source object key (invariant from the
+    // completed upload); the guard both enforces readiness and narrows the type.
+    if (video.status !== VideoStatus.READY || !video.storage_key) {
       throw new VideoNotReadyException();
     }
-    return video;
+    return video as Video & { storage_key: string };
   }
 
   /**

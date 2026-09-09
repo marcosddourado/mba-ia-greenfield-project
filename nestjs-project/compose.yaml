@@ -89,13 +89,14 @@ services:
       timeout: 5s
       retries: 5
 
-  # Dedicated video-processing worker (FFmpeg). Scaffolded here as an idle
-  # container (mirrors nestjs-api's Dockerfile.dev idle pattern); SI-03.10
-  # replaces it with a FFmpeg-based image + the worker entrypoint command.
+  # Dedicated video-processing worker (FFmpeg, per TD-03). In dev it builds from
+  # the shared Dockerfile.dev (which now carries ffmpeg) and runs the worker
+  # entrypoint in watch mode; production uses Dockerfile.worker (node dist/main.worker).
   video-worker:
     build:
       context: .
       dockerfile: Dockerfile.dev
+    command: npm run start:worker:dev
     volumes:
       - .:/home/node/app
     depends_on:

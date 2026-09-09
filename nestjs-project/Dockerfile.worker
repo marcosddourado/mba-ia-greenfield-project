@@ -1,0 +1,21 @@
+# Production image for the dedicated video-processing worker (per
+# phase-03-videos/TD-03). Base image carries the FFmpeg toolchain the processor
+# invokes via execa; the API image stays FFmpeg-free. Runs the queue consumer
+# entrypoint with no HTTP server.
+FROM node:25.6.0-slim
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /home/node/app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+USER node
+
+CMD [ "node", "dist/main.worker" ]

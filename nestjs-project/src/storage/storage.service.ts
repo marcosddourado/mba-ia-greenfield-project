@@ -1,8 +1,12 @@
+import { createWriteStream } from 'fs';
+import { pipeline } from 'stream/promises';
+import { Readable } from 'stream';
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
   GetObjectCommand,
+  PutObjectCommand,
   S3Client,
   UploadPartCommand,
 } from '@aws-sdk/client-s3';
@@ -128,6 +132,39 @@ export class StorageService {
       this.presigner,
       new GetObjectCommand({ Bucket: this.bucket, Key: key }),
       { expiresIn: PRESIGN_EXPIRES_IN_SECONDS },
+    );
+  }
+
+  /**
+   * Streams a stored object to a local file over the INTERNAL endpoint. Used by
+   * the worker to pull the source video onto disk for FFmpeg processing.
+   */
+  async downloadToFile(key: string, destPath: string): Promise<void> {
+    const result = await this.controlPlane.send(
+      new GetObjectCommand({ Bucket: this.bucket, Key: key }),
+    );
+    if (!result.Body) {
+      throw new Error(`Storage returned an empty body for key "${key}"`);
+    }
+    await pipeline(result.Body as Readable, createWriteStream(destPath));
+  }
+
+  /**
+   * Uploads a single object (e.g., the generated thumbnail) over the INTERNAL
+   * endpoint. Overwrites any existing object at the key (idempotent re-runs).
+   */
+  async putObject(
+    key: string,
+    body: Buffer,
+    contentType: string,
+  ): Promise<void> {
+    await this.controlPlane.send(
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+        Body: body,
+        ContentType: contentType,
+      }),
     );
   }
 
