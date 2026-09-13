@@ -18,6 +18,7 @@
   - Killed two redundant `nest start --watch` dev servers running inside the container — they were starving jest and recompiling on every edit (the apparent "stuck" run). Restart with `docker compose exec nestjs-api npm run start:dev` if needed.
   - Verified green (canonical commands): `npm test -- --runInBand` 144/144 (clean exit), `npm run test:e2e` 52/52, `npx tsc --noEmit` 0, `npm run lint` 0 errors.
   - **Decision (user):** keep the parallel jest default — do NOT add `maxWorkers: 1`. Integration/E2E MUST be run with `--runInBand` (plain `npm test` runs the shared-DB integration suites in parallel and contaminates them → FK / enum-collision errors). Canonical: `docker compose exec nestjs-api npm test -- --runInBand` and `npm run test:e2e`.
+  - **Superseded (post-phase review):** the acceptance criteria require plain `npm test` to be green, so `"maxWorkers": 1` was added to the `package.json` jest config (mirroring `test/jest-e2e.json` from SI-03.7). Every invocation now runs serially; `--runInBand` is no longer required.
 
 ### SI-03.2 — Entidade Video + migration
 - **Status:** completed
