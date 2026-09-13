@@ -3,6 +3,7 @@ import { User } from '../users/entities/user.entity';
 import { Channel } from '../channels/entities/channel.entity';
 import { RefreshToken } from '../auth/entities/refresh-token.entity';
 import { VerificationToken } from '../auth/entities/verification-token.entity';
+import { Video } from '../videos/entities/video.entity';
 import { CreateUsersAndChannels1775687773260 } from './migrations/1775687773260-CreateUsersAndChannels';
 import { CreateAuthTokens1777579850478 } from './migrations/1777579850478-CreateAuthTokens';
 import { createTestDataSource } from '../test/create-test-data-source';
@@ -19,7 +20,9 @@ describe('Database migrations (integration)', () => {
 
   beforeAll(async () => {
     dataSource = createTestDataSource(
-      [User, Channel, RefreshToken, VerificationToken],
+      // Video is needed for TypeORM to resolve the Channel#videos inverse
+      // relation, even though the videos table is not part of these migrations.
+      [User, Channel, RefreshToken, VerificationToken, Video],
       {
         synchronize: false,
         migrations: [
@@ -37,13 +40,25 @@ describe('Database migrations (integration)', () => {
       ),
       dataSource.query(`DROP TABLE IF EXISTS "migrations" CASCADE`),
     ]);
+    // Enum types are independent objects — dropping a table does NOT drop the
+    // enum its column used, so a leftover `verification_tokens_type_enum` makes
+    // the migration's `CREATE TYPE` fail with "type already exists" against an
+    // already-migrated DB. Drop it explicitly (after the tables) for a clean slate.
+    await dataSource.query(
+      `DROP TYPE IF EXISTS "verification_tokens_type_enum" CASCADE`,
+    );
   });
 
   afterAll(async () => {
-    // The second test undoes the last migration, leaving token tables missing.
-    // Re-apply so the shared DB is fully migrated when subsequent suites run.
-    await dataSource.runMigrations();
-    await dataSource.destroy();
+    try {
+      // The second test undoes the last migration, leaving token tables missing.
+      // Re-apply so the shared DB is fully migrated when subsequent suites run.
+      await dataSource.runMigrations();
+    } finally {
+      // Always release the connection — a throw above must not leak an open
+      // handle that hangs Jest ("did not exit one second after the test run").
+      await dataSource.destroy();
+    }
   });
 
   it('should apply all migrations and create all four tables', async () => {

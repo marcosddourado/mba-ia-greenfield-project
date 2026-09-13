@@ -46,15 +46,28 @@ $ npm run start:prod
 
 ## Run tests
 
+> **Run everything inside the container** (`docker compose exec nestjs-api …`), never on the host — the host resolves `DB_HOST` to `localhost` instead of the Compose service and uses a different Node version.
+>
+> **Integration and E2E tests share a single Postgres (and Redis/MinIO)**, so suites must never run in parallel — concurrent suites corrupt the shared tables (FK-constraint violations, `duplicate ... pg_type` errors, non-deterministic failures). Both Jest configs pin `"maxWorkers": 1` (`package.json` and `test/jest-e2e.json`), so every invocation — script, IDE, CI — runs serially without extra flags.
+
 ```bash
-# unit tests
-$ npm run test
+# unit + integration (serial via maxWorkers: 1)
+$ docker compose exec nestjs-api npm test
+
+# integration tests only
+$ docker compose exec nestjs-api npm run test:integration
 
 # e2e tests
-$ npm run test:e2e
+$ docker compose exec nestjs-api npm run test:e2e
 
 # test coverage
-$ npm run test:cov
+$ docker compose exec nestjs-api npm run test:cov
+
+# type-check (must exit 0 before a task is considered done)
+$ docker compose exec nestjs-api npx tsc --noEmit
+
+# lint
+$ docker compose exec nestjs-api npm run lint
 ```
 
 ## Deployment

@@ -6,9 +6,12 @@ import {
   createTestDataSource,
 } from '../../test/create-test-data-source';
 import { User } from '../../users/entities/user.entity';
+import { Video } from '../../videos/entities/video.entity';
 import { Channel } from './channel.entity';
 
-const ALL_ENTITIES = [User, Channel, RefreshToken, VerificationToken];
+// `Channel` declares a `videos` inverse relation (SI-03.2), so `Video` must be
+// in the DataSource entity list or TypeORM fails to resolve `Channel#videos`.
+const ALL_ENTITIES = [User, Channel, RefreshToken, VerificationToken, Video];
 
 describe('Channel entity (integration)', () => {
   let dataSource: DataSource;

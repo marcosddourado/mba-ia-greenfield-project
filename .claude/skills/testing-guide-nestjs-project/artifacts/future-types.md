@@ -2,111 +2,69 @@
 
 # Future Types
 
-Proactive guidance for NestJS artifact types not yet present in the project but likely to be added based on the project plan (authentication, video processing, email, queues).
+Proactive guidance for NestJS artifact types **not yet present** in the project but likely to be added. Types that already have a dedicated guide are cross-referenced, not duplicated.
+
+> **Already covered elsewhere (do not treat as "future"):**
+> - **Queue processors / workers** (`*.processor.ts`, BullMQ `WorkerHost`) → `processors.md`.
+> - **Pipes, interceptors, middleware, strategies** → their own `artifacts/*.md` files.
+> - **Config validation** (Joi) is **already implemented** — see the "Config Validation" section below, which documents the existing pattern.
 
 ---
 
-## Custom Decorators (`*.decorator.ts`)
+## Custom Decorators (`*.decorator.ts`) — present, mostly skip
 
-Custom decorators in NestJS are typically parameter decorators (e.g., `@CurrentUser()`) or composition decorators (combining multiple decorators into one).
+The project already has `@CurrentUser()` and `@Public()` (`src/auth/decorators/`).
 
-**What to test:**
-- Parameter decorators that extract data from the request context
-- Composition decorators that combine multiple decorators
-
-**Layer assignment:**
-- **Parameter decorators** (e.g., `@CurrentUser()`): **E2E only** — test that the extracted value is correctly passed to the handler by testing the endpoint response
-- **Composition decorators** (e.g., `@Public()` combining `@SetMetadata()` + others): **Skip** — these are declarative wrappers; test the behavior they enable via E2E
-
-**When to skip:** Most custom decorators are thin wrappers around `createParamDecorator()` or `applyDecorators()` — they have no testable logic.
+- **Parameter decorators** (`@CurrentUser()`): **E2E only** — assert the extracted value reaches the handler by testing an endpoint whose response depends on it. No direct unit test.
+- **Composition/metadata decorators** (`@Public()` = `SetMetadata`): **Skip** — declarative wrappers; test the behavior they enable (route becomes public) via E2E on the guard.
+- Most are thin wrappers around `createParamDecorator()` / `applyDecorators()` with no testable logic.
 
 ---
 
-## Event Listeners / Handlers
+## Config Validation (Joi) — ALREADY PRESENT
 
-If the project adopts NestJS's `@nestjs/event-emitter` for internal events (e.g., "user registered" triggers channel creation):
+`src/config/env.validation.ts` validates env with Joi, and `registerAs` factories (`app/auth/database/mail.config.ts`) namespace config. Covered by `src/config/env.validation.integration-spec.ts`.
 
 **What to test:**
-- Event handler correctly processes the event data
-- Side effects (DB writes, emails, queue publishing) occur as expected
+- The schema **rejects** missing/invalid required vars (app would fail to boot).
+- The schema **accepts** a valid env and applies defaults/coercion.
 
-**Layer assignment:**
-- **Handlers with business logic**: Unit (mock dependencies) + Integration (real DB/external systems)
-- **Handlers with only side effects**: Integration (real systems)
-
-**Setup pattern:**
 ```typescript
-// Test the handler directly by calling its method, not by emitting the event
-// Event emission is framework behavior; the handler's logic is your code
-describe('UserRegisteredHandler', () => {
-  it('should create a channel for the new user', async () => {
-    await handler.handleUserRegistered({ userId: 'u1', email: 'test@x.com' });
-    // Assert channel was created in the database
-  });
+it('rejects a missing JWT_SECRET', () => {
+  const { error } = envValidationSchema.validate({ ...validEnv, JWT_SECRET: undefined });
+  expect(error).toBeDefined();
 });
 ```
 
----
-
-## Queue Consumers / Processors
-
-When the project adds queue processing (e.g., BullMQ for video transcoding):
-
-**What to test:**
-- Processor correctly handles job data
-- Error handling — failed jobs are retried or moved to dead letter queue
-- Side effects (DB updates, storage writes) occur as expected
-
-**Layer assignment:**
-- **Processor with business logic**: Unit (mock deps) + Integration (real DB/storage)
-- **Processor with only external system calls**: Integration (real systems)
-
-**Setup pattern:**
-```typescript
-// Test the process method directly
-describe('VideoProcessorConsumer', () => {
-  it('should update video status after processing', async () => {
-    const job = { data: { videoId: 'v1', filePath: '/tmp/video.mp4' } } as Job;
-    await processor.process(job);
-    // Assert video status updated in DB
-  });
-});
-```
+When adding Phase 03 vars (storage endpoint/bucket/credentials, Redis host/port), extend the Joi schema **and** its spec with a reject-case per new required var.
 
 ---
 
-## Scheduled Tasks (Cron)
+## Event Listeners / Handlers (`@nestjs/event-emitter`) — not yet present
 
-If the project adds `@nestjs/schedule` for periodic tasks:
+If internal events are adopted (e.g., "video processed" → notify):
 
-**What to test:**
-- The scheduled method's logic executes correctly
-- Side effects (cleanup, reports, notifications) work as expected
-
-**Layer assignment:**
-- Test the method directly as a regular service method (Unit and/or Integration)
-- Do NOT test that the cron schedule triggers — trust `@nestjs/schedule`
+- **Handlers with business logic:** Unit (mock deps) + Integration (real DB/external systems).
+- **Handlers with only side effects:** Integration (real systems).
+- Test the handler method **directly** (call it) — emission is framework behavior; the handler's logic is your code.
 
 ---
 
-## Health Checks
+## Scheduled Tasks / Cron (`@nestjs/schedule`) — not yet present
 
-If the project adds `@nestjs/terminus` for health endpoints:
-
-**What to test:**
-- Health endpoint returns 200 when all services are healthy
-- Health endpoint returns 503 when a dependency is down
-
-**Layer assignment:** **E2E** — test the `/health` endpoint with supertest
+- Test the scheduled **method** as a regular service method (Unit and/or Integration).
+- Do NOT test that the cron schedule fires — trust `@nestjs/schedule`.
+- Plausible Phase 03+ use: reaping stale `draft`/`failed` uploads and aborting their multipart uploads.
 
 ---
 
-## Config Validation
+## Health Checks (`@nestjs/terminus`) — not yet present
 
-If the project adds `@nestjs/config` with schema validation (e.g., Joi or class-validator):
+- **E2E:** `/health` returns 200 when dependencies are up, 503 when one is down.
+- With Phase 03, a health check would probe Postgres, Redis, and MinIO reachability.
 
-**What to test:**
-- App fails to start with missing required env vars
-- App fails to start with invalid env var values
+---
 
-**Layer assignment:** **Unit** (module compilation) — the module should fail to compile with bad config
+## Strategies (Passport) — unlikely for this project
+
+The project deliberately uses **custom JWT guards**, not Passport strategies (per `phase-02-auth/TD-02` divergence). If a Passport strategy is ever added, see `strategies.md` (test via the guard at the E2E layer).

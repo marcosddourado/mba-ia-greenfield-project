@@ -11,10 +11,12 @@ In NestJS terms, this means:
 | Dependency type | In unit tests | In integration tests | In E2E tests |
 |---|---|---|---|
 | **Owned services** (services you wrote) | Mock with `useValue` | Use real (or mock if unrelated) | Use real |
-| **Configured libs** (JwtModule, CacheModule, ThrottlerModule) | Use real with test config | Use real | Use real |
+| **Configured libs** (JwtModule, ThrottlerModule, BullModule) | Use real with test config | Use real | Use real |
 | **Side-effect deps** (email, external APIs) | Mock | Use real capture (Mailpit) or fake | Use real capture or fake |
 | **Database** (TypeORM repositories) | Mock in unit tests | Use real (Docker PostgreSQL) | Use real |
-| **Slow pure functions** (bcrypt hash) | Do NOT mock — use lower cost factor | Do NOT mock | Do NOT mock |
+| **Object storage client** (S3/MinIO `StorageService`) | Mock at the `StorageService` boundary | Use real (Docker MinIO) — assert presigned URL via real HTTP | Use real |
+| **Queue producer** (BullMQ `Queue` via `getQueueToken`) | Mock the `Queue` — assert `add` was called | Use real Redis queue — inspect `getJobs()` | Use real |
+| **Slow pure functions** (argon2 hash) | Do NOT mock — use lower `memoryCost`/`timeCost` | Do NOT mock | Do NOT mock |
 
 ## When a Mock is Healthy
 

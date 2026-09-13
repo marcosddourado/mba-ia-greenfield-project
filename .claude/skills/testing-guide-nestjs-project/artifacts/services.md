@@ -4,167 +4,120 @@
 
 ## What to test
 
-- **Branch logic** — conditionals, permission checks, state transitions, validation rules
-- **Database contracts** — queries return expected results, constraints are respected, transactions work
-- **External system contracts** — storage uploads succeed, emails are sent via Mailpit, queue jobs are published
-- **Configured lib behavior** — JWT tokens encode correct claims, cache TTL works, throttle limits apply
-- **Error paths** — service throws correct domain exceptions for invalid states, missing resources, duplicates
+- **Branch logic** — conditionals, permission/ownership checks, state transitions (e.g., video `draft→processing→ready/failed`), visibility rules
+- **Database contracts** — queries return expected results, constraints respected, transactions and compensation/rollback paths work
+- **External system contracts** — S3/MinIO multipart + presigned URLs, BullMQ job enqueue, emails via Mailpit
+- **Configured lib behavior** — JWT tokens encode correct claims/expiration
+- **Error paths** — the service throws the correct **domain exception** for invalid states, missing resources, duplicates (never a raw NestJS HTTP exception — see `filters.md`)
 
 ## Layer assignment
 
-Services are the most varied artifact type. The test layer depends on the service's characteristics:
+Services are the most varied artifact type. The layer depends on the service's characteristics:
 
 | Scenario | Unit | Integration | Why |
 |---|---|---|---|
-| Branching logic only (no system boundary) | ✅ mock owned services | — | Logic can be proven in isolation |
+| Branching logic only (no system boundary) | ✅ mock owned services | — | Logic proven in isolation |
 | DB access only (no branching) | — | ✅ real DB | No logic to unit-test; the DB contract IS the behavior |
 | Branching + DB access | ✅ mock repo (test branches) | ✅ real DB (test queries) | Unit proves logic; integration proves queries — neither substitutes the other |
-| Configured lib (JWT, cache, throttle) | ✅ real lib with test config | — | Mocking hides config bugs; use real lib with test-safe values |
-| Side-effect dep (email, storage) | — | ✅ real capture service | Mailpit captures SMTP; local filesystem for storage |
-| Branching + side-effect dep | ✅ mock the dep (test branches) | ✅ real capture service | Both layers needed |
+| Configured lib (JWT) | ✅ real lib with test config | — | Mocking hides config bugs |
+| Side-effect: email | — | ✅ Mailpit capture | Real SMTP transport, no delivery |
+| Side-effect: storage (S3/MinIO) | ✅ mock storage to test branches | ✅ real MinIO adapter | Unit proves control flow; integration proves the presigned-URL/multipart contract |
+| Side-effect: queue producer (BullMQ) | ✅ mock the `Queue` (`getQueueToken`) | ✅ real Redis queue | Unit proves "enqueues on complete"; integration proves the job lands in Redis |
 | Pure delegation (no branching, no boundary) | — | — | Skip — no testable behavior |
 
-**Critical rule:** A unit test that mocks a repository does NOT prove the query is correct. If a service accesses the database, it needs an integration test with a real DB — regardless of whether it also has a unit test.
+**Critical rule:** a unit test that mocks a repository/`S3Client`/`Queue` does NOT prove the query, URL, or enqueue is correct. If a service crosses a system boundary, it needs an integration test with the real system — regardless of whether it also has a unit test. (The queue **consumer** side is a processor — see `processors.md`.)
 
-## Setup pattern — Unit test (branching logic)
+## Setup pattern — Unit test (branching + configured lib + mocked boundaries)
 
 ```typescript
-// auth.service.spec.ts
 import { Test, TestingModule } from '@nestjs/testing';
-import { AuthService } from './auth.service';
-import { UsersService } from '../users/users.service';
 import { JwtModule } from '@nestjs/jwt';
+import { getQueueToken } from '@nestjs/bullmq';
 
-describe('AuthService (unit)', () => {
-  let authService: AuthService;
-  let usersService: jest.Mocked<Partial<UsersService>>;
+describe('VideosService (unit)', () => {
+  let service: VideosService;
+  const storage = { createMultipartUpload: jest.fn(), presignUploadPart: jest.fn(),
+                    completeMultipartUpload: jest.fn(), abortMultipartUpload: jest.fn() };
+  const queue = { add: jest.fn() };
+  const repo = { save: jest.fn(), findOneBy: jest.fn(), manager: {} };
 
   beforeAll(async () => {
-    usersService = {
-      findByEmail: jest.fn(),
-      create: jest.fn(),
-    };
-
     const module: TestingModule = await Test.createTestingModule({
-      imports: [
-        JwtModule.register({ secret: 'test-secret', signOptions: { expiresIn: '1h' } }),
-      ],
       providers: [
-        AuthService,
-        { provide: UsersService, useValue: usersService },
+        VideosService,
+        { provide: StorageService, useValue: storage },      // owned boundary → mock
+        { provide: getQueueToken('video-processing'), useValue: queue }, // producer boundary → mock
+        { provide: getRepositoryToken(Video), useValue: repo },
       ],
     }).compile();
-
-    authService = module.get(AuthService);
+    service = module.get(VideosService);
   });
 
-  it('should throw when user not found', async () => {
-    usersService.findByEmail.mockResolvedValue(null);
+  afterEach(() => jest.restoreAllMocks());
 
-    await expect(authService.login('no@user.com', 'pass'))
-      .rejects.toThrow(/* domain exception */);
+  it('enqueues exactly one processing job on completeUpload', async () => {
+    repo.findOneBy.mockResolvedValue({ id: 'v1', status: 'draft', upload_id: 'u1' });
+    await service.completeUpload('pub1', [{ partNumber: 1, eTag: 'e' }]);
+    expect(queue.add).toHaveBeenCalledWith('process', { videoId: 'v1' });
   });
 
-  it('should throw when password is invalid', async () => {
-    usersService.findByEmail.mockResolvedValue({
-      id: '1', email: 'user@test.com', password: 'hashed',
-    } as any);
-
-    await expect(authService.login('user@test.com', 'wrong'))
-      .rejects.toThrow(/* domain exception */);
+  it('retries public_id generation on collision, never surfacing the error', async () => {
+    repo.save.mockRejectedValueOnce(new QueryFailedError('', [], { code: '23505' } as any))
+             .mockResolvedValueOnce({ id: 'v1' });
+    await expect(service.createDraft(dto, channelId)).resolves.toBeDefined();
+    expect(repo.save).toHaveBeenCalledTimes(2);
   });
 });
 ```
 
 **Key points:**
-- Mock **owned services** (`UsersService`) with `useValue` — they have their own tests
-- Use **real** `JwtModule` with test config — it's a configured lib; mocking hides config bugs
-- Test each branch: success path, not found, invalid credentials, duplicate, etc.
-- Mock return values with `jest.fn().mockResolvedValue()`
+- Mock **owned services / boundaries** (`StorageService`, the `Queue`, the repo) with `useValue` — each has its own tests.
+- Use **real** `JwtModule` with test config when the service signs/verifies tokens — mocking hides config bugs.
+- Assert **observable branch outcomes** (job enqueued, retry happened, domain exception thrown), not internal calls.
+- Visibility/authorization logic (e.g., `getByPublicId` returning `ready`-only for anonymous) is pure branching → unit test each branch.
 
 ## Setup pattern — Integration test (DB contract)
 
-```typescript
-// users.service.integration.spec.ts
-import { Test, TestingModule } from '@nestjs/testing';
-import { TypeOrmModule } from '@nestjs/typeorm';
-import { DataSource } from 'typeorm';
-import { UsersService } from './users.service';
-import { User } from './user.entity';
+Use the shared helper for a standalone DataSource, or `TypeOrmModule.forRoot()` when exercising the service through Nest DI:
 
-describe('UsersService (integration)', () => {
-  let service: UsersService;
+```typescript
+import { createTestDataSource, cleanAllTables } from '../test/create-test-data-source';
+
+describe('ChannelsService (integration)', () => {
+  let service: ChannelsService;
   let dataSource: DataSource;
 
   beforeAll(async () => {
-    const module: TestingModule = await Test.createTestingModule({
-      imports: [
-        TypeOrmModule.forRoot({
-          type: 'postgres',
-          host: process.env.DB_HOST ?? 'localhost',
-          port: Number(process.env.DB_PORT ?? 5432),
-          username: process.env.DB_USERNAME ?? 'streamtube',
-          password: process.env.DB_PASSWORD ?? 'streamtube',
-          database: process.env.DB_DATABASE ?? 'streamtube',
-          entities: [User],
-          synchronize: true,
-        }),
-        TypeOrmModule.forFeature([User]),
-      ],
-      providers: [UsersService],
-    }).compile();
-
-    service = module.get(UsersService);
-    dataSource = module.get(DataSource);
+    dataSource = createTestDataSource([User, Channel]);
+    await dataSource.initialize();
+    service = new ChannelsService(dataSource.getRepository(Channel), /* ... */);
   });
+  afterEach(() => cleanAllTables(dataSource));
+  afterAll(() => dataSource.destroy());
 
-  afterAll(async () => {
-    await dataSource.destroy();
-  });
-
-  beforeEach(async () => {
-    await dataSource.query('DELETE FROM "users"');
-  });
-
-  it('should find user by email', async () => {
-    await dataSource.query(
-      `INSERT INTO "users" (email, password) VALUES ($1, $2)`,
-      ['test@example.com', 'hashed'],
-    );
-
-    const user = await service.findByEmail('test@example.com');
-    expect(user).toBeDefined();
-    expect(user?.email).toBe('test@example.com');
-  });
-
-  it('should throw on duplicate email', async () => {
-    await service.create({ email: 'dup@test.com', password: 'hashed' });
-
-    await expect(
-      service.create({ email: 'dup@test.com', password: 'other' }),
-    ).rejects.toThrow();
+  it('rejects a duplicate nickname', async () => {
+    await service.create({ userId: 'u1', name: 'A', nickname: 'dup' });
+    await expect(service.create({ userId: 'u2', name: 'B', nickname: 'dup' }))
+      .rejects.toThrow(/* domain exception */);
   });
 });
 ```
 
 **Key points:**
-- Use real PostgreSQL via Docker
-- Import `TypeOrmModule.forRoot()` and `TypeOrmModule.forFeature()` in the test module
-- Clean up with `dataSource.query('DELETE FROM "table"')` between tests
-- Test the actual queries the service makes — not mocked return values
+- Real PostgreSQL via Docker (`createTestDataSource` defaults to `synchronize: true`).
+- Clean with `cleanAllTables()` / `dataSource.query('DELETE …')` — never `repository.delete({})`.
+- Test the actual queries/constraints — not mocked return values.
+- For storage/queue integration setup, see `references/external-systems.md`.
 
 ## When to skip
 
-- Services that only delegate without branching (e.g., a service that calls `repository.findOneBy()` and returns the result). The integration test for the entity/repository covers this.
-- `AppService.getHello()` — no branching, no system boundary, trivial return value
+- Services that only delegate without branching (e.g., a thin `findOneBy` passthrough) — the entity integration test covers it.
+- `AppService.getHello()` — no branching, no boundary, trivial return.
 
 ## Examples from project
 
-Currently only `AppService` exists (scaffolding — no branching, no DB → skip).
-
-When domain services are created:
-- **AuthService** [branching + configured lib (JWT)] → Unit: test login/register/reset branches with mocked UsersService + real JwtModule. Integration: if it directly queries the DB.
-- **UsersService** [DB access + possible branching] → Unit: test branch logic if any (mock repo). Integration: test DB queries with real PostgreSQL.
-- **VideosService** [DB + storage + queue] → Unit: test status transitions, visibility rules (mock deps). Integration: test DB queries, storage uploads (local adapter), queue publishing.
-- **CommentsService** [DB + branching for nesting] → Unit: test nesting depth validation. Integration: test nested comment queries.
-- **ChannelsService** [DB access] → Integration: test slug uniqueness, ownership queries.
+- **AuthService** [branching + configured lib (JWT) + DB] → Unit: login/register/reset branches with mocked `UsersService` + real `JwtModule` (`auth.service.spec.ts`). Integration: token/DB contract (`auth.service.integration-spec.ts`).
+- **UsersService** [DB access] → Integration: real Postgres queries (`users.service.integration-spec.ts`).
+- **ChannelsService** [DB + branching] → Unit (nickname logic) + Integration (uniqueness/ownership).
+- **MailService** [side-effect: SMTP] → Integration via Mailpit (`mail.service.integration-spec.ts`).
+- **VideosService** (Phase 03) [DB + storage + queue producer + branching] → Unit: status transitions, visibility rules, `public_id` collision retry, enqueue (mock storage/queue/repo). Integration: real MinIO presigning/multipart + real Redis enqueue + DB draft persistence. The processing **consumer** is `VideoProcessor` — see `processors.md`.

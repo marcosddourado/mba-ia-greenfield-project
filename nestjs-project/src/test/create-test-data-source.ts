@@ -24,6 +24,10 @@ export function createTestDataSource(
 }
 
 export async function cleanAllTables(dataSource: DataSource): Promise<void> {
+  // videos.channel_id → channels.id, so videos must be cleared before channels
+  // (reverse-FK order). Left-over rows from the videos suites would otherwise
+  // block the channels DELETE under --runInBand.
+  await dataSource.query('DELETE FROM "videos"');
   await dataSource.query('DELETE FROM "refresh_tokens"');
   await dataSource.query('DELETE FROM "verification_tokens"');
   await dataSource.query('DELETE FROM "channels"');

@@ -105,12 +105,14 @@ A aplicação ficará disponível em **http://localhost:3001**.
 
 ```bash
 cd nestjs-project
-docker compose exec nestjs-api npm test               # unitários + integração
-docker compose exec nestjs-api npm run test:e2e       # end-to-end (HTTP via supertest)
-docker compose exec nestjs-api npm run test:cov       # cobertura
+docker compose exec nestjs-api npm test -- --runInBand          # unitários + integração (serial — obrigatório)
+docker compose exec nestjs-api npm run test:e2e                 # end-to-end (HTTP via supertest)
+docker compose exec nestjs-api npm run test:cov -- --runInBand  # cobertura
 ```
 
-Sufixos: `*.spec.ts` (unitário), `*.integration-spec.ts` (integração com banco real), `*.e2e-spec.ts` (end-to-end). Testes de integração/e2e rodam com `--runInBand`.
+Sufixos: `*.spec.ts` (unitário), `*.integration-spec.ts` (integração com banco real), `*.e2e-spec.ts` (end-to-end).
+
+> ⚠️ Os testes de integração e e2e compartilham **um único** Postgres, então **precisam** rodar com `--runInBand` (serial). Rodar `npm test` **sem** a flag executa as suítes em paralelo e corrompe as tabelas compartilhadas — violações de FK (`channels`→`users`), erros `duplicate ... pg_type` / `relation already exists`, e falhas **não-determinísticas** (um conjunto diferente de testes falha a cada execução). Os unitários (`*.spec.ts`) são seguros em paralelo, mas `npm test` também inclui os de integração — por isso a flag é obrigatória no comando acima.
 
 ### Frontend (Vitest + Playwright)
 

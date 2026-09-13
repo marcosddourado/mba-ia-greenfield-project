@@ -1,0 +1,11 @@
+# Masking storage gateway — the only host-facing door to MinIO.
+# Served over plain HTTP on :9000 (no hostname → no automatic HTTPS).
+# `header_up Host {hostport}` forwards the client's Host header *including the
+# port* so a SigV4 presigned URL signed against the public host (e.g.
+# `localhost:9000`) validates at MinIO. `{host}` alone strips the port, which
+# makes MinIO recompute a different signature → SignatureDoesNotMatch (403).
+:9000 {
+	reverse_proxy minio:9000 {
+		header_up Host {hostport}
+	}
+}

@@ -4,127 +4,104 @@
 
 ## Naming & Placement
 
-| Layer | File Pattern | Location | Jest Config |
+| Layer | File Pattern | Location | Matched by |
 |---|---|---|---|
-| **Unit** | `*.spec.ts` | Colocated with source in `src/` | `package.json` → `jest` section (rootDir: `src`, testRegex: `.*\.spec\.ts$`) |
-| **Integration** | `*.integration.spec.ts` | Colocated with source in `src/` | Same config as unit (matched by `.*\.spec\.ts$`) |
-| **E2E** | `*.e2e-spec.ts` | `test/` directory | `test/jest-e2e.json` (rootDir: `.`, testRegex: `.e2e-spec.ts$`) |
+| **Unit** | `*.spec.ts` | Colocated with source in `src/` | `package.json` jest `testRegex: .*\.(spec\|integration-spec)\.ts$` |
+| **Integration** | `*.integration-spec.ts` | Colocated with source in `src/` | same regex (the `integration-spec` alternative) |
+| **E2E** | `*.e2e-spec.ts` | `test/` directory | `test/jest-e2e.json` (`testRegex: .e2e-spec.ts$`) |
 
-### Examples
+> **The integration suffix is `*.integration-spec.ts` (hyphen), not `*.integration.spec.ts`.** The dotted form is NOT matched by the project's `testRegex` and would silently never run. This mirrors `nestjs-project/CLAUDE.md` → "Test Type Selection".
+
+### Examples (real files in the project)
 
 ```
 src/
-  users/
-    users.service.ts
-    users.service.spec.ts              # Unit test
-    users.service.integration.spec.ts  # Integration test
-    users.module.ts
-    users.module.spec.ts               # Module compilation test
-    user.entity.ts
-    user.entity.integration.spec.ts    # Entity integration test
   auth/
     auth.service.ts
-    auth.service.spec.ts               # Unit test
+    auth.service.spec.ts                       # Unit
+    auth.service.integration-spec.ts           # Integration
     auth.module.ts
-    auth.module.spec.ts                # Module compilation test
+    auth.module.spec.ts                        # Module compilation
+    entities/refresh-token.entity.ts
+    entities/refresh-token.entity.integration-spec.ts
+    guards/jwt-auth.guard.ts
+    guards/jwt-auth.guard.spec.ts              # Guard unit
+  common/filters/domain-exception.filter.spec.ts
+  config/env.validation.integration-spec.ts
+  database/migrations.integration-spec.ts
 test/
-  users.e2e-spec.ts                    # E2E tests for /users
-  auth.e2e-spec.ts                     # E2E tests for /auth
-  channels.e2e-spec.ts                 # E2E tests for /channels
-  videos.e2e-spec.ts                   # E2E tests for /videos
+  auth.e2e-spec.ts
+  app.e2e-spec.ts
+  jest-e2e.json
 ```
 
-## Running Tests
+Shared test helpers live in `src/test/`:
+- `create-test-data-source.ts` — `createTestDataSource(entities, opts)` + `cleanAllTables(dataSource)`.
+- `mailpit.ts` — `getMailpitMessages()`, `getMailpitMessage(id)`, `clearMailpitMessages()`.
 
-All commands run inside the Docker container:
+## Running tests
+
+Every test command runs **inside the container** (`nestjs-project/CLAUDE.md` — host runs cause env-var/Node divergence):
 
 ```bash
-# Unit + integration tests (all *.spec.ts in src/)
-docker compose -f nestjs-project/compose.yaml exec nestjs-api npm test
+# Unit + integration (all *.spec.ts / *.integration-spec.ts in src/) — serialize shared DB/Redis
+docker compose exec nestjs-api npm test -- --runInBand
 
-# Unit + integration tests in watch mode
-docker compose -f nestjs-project/compose.yaml exec nestjs-api npm run test:watch
+# Integration only
+docker compose exec nestjs-api npm run test:integration
 
-# E2E tests
-docker compose -f nestjs-project/compose.yaml exec nestjs-api npm run test:e2e
+# E2E (test/jest-e2e.json)
+docker compose exec nestjs-api npm run test:e2e
 
-# Coverage report
-docker compose -f nestjs-project/compose.yaml exec nestjs-api npm run test:cov
+# One file
+docker compose exec nestjs-api npm test -- --runInBand src/auth/auth.service.spec.ts
 
-# Run specific test file
-docker compose -f nestjs-project/compose.yaml exec nestjs-api npx jest --testPathPattern users.service.spec
+# Find leaking open handles when Jest hangs
+docker compose exec nestjs-api npm test -- --runInBand --detectOpenHandles
 ```
 
-## Coverage Targets (Thorough)
+Integration + E2E **must** use `--runInBand` — they share one Postgres and one Redis; parallel runs corrupt shared state (`test:integration` and `test:e2e` already set it).
 
-Since the team follows a **thorough** coverage philosophy:
+## Coverage philosophy — Pragmatic
 
-| Metric | Target | Notes |
-|---|---|---|
-| **Statements** | >= 85% | Overall project target |
-| **Branches** | >= 80% | Ensures conditional logic is tested |
-| **Functions** | >= 85% | Every significant function should be tested |
-| **Lines** | >= 85% | Consistent with statement coverage |
+The team follows a **pragmatic** philosophy: **test what matters** — business-critical paths and system boundaries — and skip trivial or low-risk code. There are **no hard global coverage-percentage gates**; a green suite is judged by whether the §2 "Worth testing" criteria (in `../SKILL.md`) are covered, not by a number.
 
-**Per-artifact expectations:**
-- Services with branching: 90%+ branch coverage
-- Entities: 100% constraint coverage (every unique, not-null, select:false tested)
-- Controllers: 0% unit coverage (tested only via E2E)
-- Modules with configured imports: 100% compilation coverage
-- Guards: 100% of access control paths tested via E2E
-- Exception filters: 100% of mapping rules tested
+Concretely:
+- **Cover:** service branching, entity constraints, DB/storage/queue contracts, guard authorization, filter error mapping, controller HTTP contracts (status/validation/auth), security boundaries, race conditions (`public_id` collision, job idempotency).
+- **Skip:** trivial getters (`getHello`), framework passthrough, mirror tests, static field existence, validation-decorator internals.
+- Use `npm run test:cov` as a **gap-finding tool** (spot an untested branch), not as a bar to clear.
 
-**What to exclude from coverage:**
-Add to jest config `coveragePathIgnorePatterns`:
-- `main.ts` — bootstrap file, not testable via unit/integration
-- `*.module.ts` — modules are tested by compilation tests, not by line coverage
-- `*.dto.ts` — DTOs are declarative; validation is tested via E2E
-- `*.constants.ts` — static values, no behavior
-- `dist/` — compiled output
+## Jest configuration (authoritative — from `package.json`)
 
-## Jest Configuration
-
-**Unit + Integration** (in `package.json`):
 ```json
 {
   "jest": {
     "moduleFileExtensions": ["js", "json", "ts"],
     "rootDir": "src",
-    "testRegex": ".*\\.spec\\.ts$",
+    "testRegex": ".*\\.(spec|integration-spec)\\.ts$",
     "transform": { "^.+\\.(t|j)s$": "ts-jest" },
     "collectCoverageFrom": ["**/*.(t|j)s"],
     "coverageDirectory": "../coverage",
-    "testEnvironment": "node"
+    "testEnvironment": "node",
+    "setupFiles": ["dotenv/config"]
   }
 }
 ```
 
-**E2E** (in `test/jest-e2e.json`):
-```json
-{
-  "moduleFileExtensions": ["js", "json", "ts"],
-  "rootDir": ".",
-  "testEnvironment": "node",
-  "testRegex": ".e2e-spec.ts$",
-  "transform": { "^.+\\.(t|j)s$": "ts-jest" }
-}
-```
+`setupFiles: ["dotenv/config"]` is load-bearing — without it `.env` is not loaded into the Jest process and `DB_HOST`/`JWT_SECRET`/`MAIL_HOST` fall back to `localhost`/undefined, breaking container-to-container DNS.
 
-## Test Structure
+**E2E** (`test/jest-e2e.json`): `rootDir: "."`, `testRegex: ".e2e-spec.ts$"`, ts-jest transform, `setupFiles: ["dotenv/config"]`.
 
-Follow Arrange-Act-Assert (AAA):
+## Test structure
+
+Follow Arrange-Act-Assert:
 ```typescript
-it('should throw when user not found', async () => {
-  // Arrange
-  usersService.findByEmail.mockResolvedValue(null);
-
-  // Act & Assert
-  await expect(authService.login('no@user.com', 'pass'))
-    .rejects.toThrow(EntityNotFoundException);
+it('rejects an unknown user', async () => {
+  usersService.findByEmail.mockResolvedValue(null);           // Arrange
+  await expect(authService.login('no@user.com', 'pass'))       // Act + Assert
+    .rejects.toThrow(/* domain exception */);
 });
 ```
-
-Use descriptive `describe` / `it` blocks:
-- `describe('AuthService')` → `describe('login')` → `it('should throw when ...')`
-- Name tests with "should" + expected behavior
-- Group by method or scenario, not by test type
+- `describe('AuthService')` → `describe('login')` → `it('should …')`.
+- Name tests with the observable behavior, not the implementation.
+- `beforeAll`/`afterAll` for expensive setup (app, DataSource); `beforeEach`/`afterEach` for per-test state (table/queue/Mailpit cleanup).

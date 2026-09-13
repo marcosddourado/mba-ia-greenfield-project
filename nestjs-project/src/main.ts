@@ -1,7 +1,8 @@
 import { NestFactory } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import type { ConfigType } from '@nestjs/config';
-import { ValidationPipe } from '@nestjs/common';
+import { Logger, ValidationPipe } from '@nestjs/common';
+import type { NextFunction, Request, Response } from 'express';
 import { SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import { DomainExceptionFilter } from './common/filters/domain-exception.filter';
@@ -14,6 +15,19 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const configService = app.get(ConfigService);
   const port = configService.get<number>('app.port') ?? 3000;
+
+  // Per-request access log (method, url, status, duration). NestJS does not log
+  // HTTP requests by default; this makes request activity visible in dev.
+  const httpLogger = new Logger('HTTP');
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const startedAt = Date.now();
+    res.on('finish', () => {
+      httpLogger.log(
+        `${req.method} ${req.originalUrl} ${res.statusCode} - ${Date.now() - startedAt}ms`,
+      );
+    });
+    next();
+  });
 
   app.useGlobalPipes(
     new ValidationPipe({
