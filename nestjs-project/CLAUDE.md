@@ -2,19 +2,22 @@
 
 ## Environment Startup Verification
 
-**Default behavior:** starting the environment means starting **only infrastructure services** (database, mail, etc.) — **never** start the NestJS application server unless the user explicitly asks to run/serve the project (e.g., "rode o projeto", "suba o servidor", "run the app").
+**Default behavior:** starting the environment means starting **only infrastructure services** (database, mail, storage, queue, worker) — **never** start the NestJS application server unless the user explicitly asks to run/serve the project (e.g., "rode o projeto", "suba o servidor", "run the app").
 
 After starting infrastructure, always confirm the containers are up before proceeding:
 
 ```bash
-docker compose ps   # all services must show status "running"
+docker compose ps -a   # every service "running", except the one-shot `createbuckets` → "exited (0)"
 ```
 
 Then verify each infrastructure service is actually ready to accept connections — not just running:
 
 - **PostgreSQL:** `docker compose exec db pg_isready -U streamtube` — expect `accepting connections`
+- **Redis:** `docker compose exec redis redis-cli ping` — expect `PONG`
+- **MinIO (through the gateway):** `curl -s -o /dev/null -w '%{http_code}' http://localhost:9000/minio/health/live` — expect `200`
+- **Video worker:** `docker compose logs video-worker` — expect `Video-processing worker started`. If `video-worker` exited (e.g. it started before `npm install`), run `docker compose up -d video-worker`.
 
-Only start the NestJS dev server (`npm run start:dev`) when the user **explicitly** asks to run the application — never as part of "start the environment".
+The `video-worker` container is part of the environment (it starts with `docker compose up -d`). Only start the NestJS **API** dev server (`npm run start:dev`) when the user **explicitly** asks to run the application — never as part of "start the environment".
 
 ## Development Environment
 
@@ -27,13 +30,24 @@ docker compose up -d
 # Install dependencies (first time only)
 docker compose exec nestjs-api npm install
 
+# Apply migrations (first time, and after pulling new migrations)
+docker compose exec nestjs-api npm run migration:run
+
 # Run the dev server (watch mode)
 docker compose exec nestjs-api npm run start:dev
 ```
 
+`ffmpeg`/`ffprobe` are baked into `Dockerfile.dev` (shared by `nestjs-api` and `video-worker`). Images built before Phase 03 lack them — rebuild with `docker compose build`.
+
 Services:
 - `nestjs-api` — NestJS API, port `3000`
 - `db` — PostgreSQL 17, port `5432`, database `streamtube`, user/password `streamtube`
+- `mailpit` — SMTP `1025`, web UI `8025`
+- `minio` — S3-compatible object storage. Its API port `9000` is **not** published to the host; web console on `9001`
+- `createbuckets` — one-shot `minio/mc` job that creates the `STORAGE_BUCKET`, then exits
+- `storage-gateway` — Caddy reverse proxy (`gateway/Caddyfile`), port `9000`; the only host/browser-facing door to MinIO
+- `redis` — Redis 7 for BullMQ, port `6379`
+- `video-worker` — dedicated video-processing worker (`npm run start:worker:dev`, entrypoint `src/main.worker.ts`), no HTTP port
 
 All verification and teardown commands run on the **host machine**:
 
@@ -44,9 +58,14 @@ curl http://localhost:3000
 # Verify PostgreSQL is ready (runs inside the db container)
 docker compose exec db pg_isready -U streamtube
 
+# Verify Redis and MinIO (through the gateway) are ready
+docker compose exec redis redis-cli ping
+curl -s -o /dev/null -w '%{http_code}' http://localhost:9000/minio/health/live
+
 # Check container logs
 docker compose logs nestjs-api
 docker compose logs db
+docker compose logs video-worker
 
 # Tear down the entire environment
 docker compose down
@@ -62,6 +81,9 @@ docker compose down
 npm run start:dev                        # Dev server with hot-reload
 npm run build                            # Compile to dist/
 npm run start:prod                       # Run compiled build
+npm run start:worker                     # Run compiled video worker (dist/main.worker)
+npm run migration:run                    # Apply TypeORM migrations
+npm run migration:generate -- src/database/migrations/<Name>   # Generate a migration from entity changes
 
 npm test                                 # Unit + integration tests (serial)
 npm run test:watch                       # Unit + integration tests in watch mode
@@ -99,7 +121,7 @@ During active development, run only the tests related to the file being changed 
 
 Commands that never exit (dev server, watch modes) must be run in background in the Bash tool — otherwise the agent blocks indefinitely waiting for the process to return.
 
-This applies to: `start:dev`, `start:prod`, `test:watch`, and any other persistent process.
+This applies to: `start:dev`, `start:prod`, `start:worker`, `start:worker:dev`, `test:watch`, and any other persistent process.
 
 ## Test Type Selection
 
@@ -148,6 +170,44 @@ NestJS with standard module structure. Source lives in `src/`, compiled output i
 
 - Each domain feature gets its own module (e.g., `UsersModule`, `VideosModule`) registered in `AppModule`
 - Controllers handle HTTP routing; Services hold business logic; both are scoped to their module
+- Two entrypoints share `src/`: `src/main.ts` (HTTP API, `AppModule`) and `src/main.worker.ts` (video worker, `WorkerModule`, no HTTP server)
+
+## Videos Module (Phase 03)
+
+Upload, processing, and delivery of videos up to 10 GB. The API **never receives or proxies video bytes** — it only brokers presigned URLs. Contracts, authorization matrix, and error catalog: `docs/phases/phase-03-videos/phase-03-videos.md`.
+
+### Layout
+
+- `src/videos/` — `VideosController`, `VideosService` (draft, upload handshake, visibility, delivery URLs, SSE status), `VideoOwnerGuard`, DTOs, domain exceptions (`exceptions/video.exceptions.ts`), `Video` entity (many-to-one `Channel`), storage key scheme (`video-storage-keys.ts` → `videos/<publicId>/source`, `videos/<publicId>/thumbnail.jpg`)
+- `src/videos/processors/video-processing.processor.ts` + `src/videos/worker.module.ts` — the FFmpeg worker (`ffprobe` metadata/duration + `ffmpeg` thumbnail, via `execa`)
+- `src/storage/` — `StorageService`, the S3 SDK adapter (multipart, presign, download, put)
+- `src/queue/` — `QueueModule` (BullMQ Redis connection + `video-processing` queue; name in `queue.constants.ts`)
+- Config: `storage.config.ts` (`STORAGE_*`) and `queue.config.ts` (`REDIS_*`), validated in `env.validation.ts`
+- Migration: `src/database/migrations/1788745243630-CreateVideos.ts`
+
+### Endpoints
+
+| Endpoint | Access | Effect |
+|---|---|---|
+| `POST /videos` | authenticated | Creates `draft` + opens multipart upload |
+| `POST /videos/:publicId/upload/part-urls` | owner | Presigned `UploadPart` URLs (`draft → uploading`) |
+| `POST /videos/:publicId/upload/complete` | owner | Completes multipart, `→ processing`, enqueues job |
+| `DELETE /videos/:publicId/upload` | owner | Aborts multipart, `→ failed` (idempotent) |
+| `GET /videos/:publicId` | public (`ready` only); owner sees any status | Video DTO |
+| `GET /videos/:publicId/status` | owner | SSE `{ status, progress }` |
+| `GET /videos/:publicId/stream` · `/download` | public, `ready` only | 302 to presigned gateway URL (Range / attachment) |
+
+### Rules and gotchas
+
+- **No file bytes through the API.** Do not add multipart/`multer` upload endpoints for videos. The 10 GB ceiling (`MAX_FILE_SIZE_BYTES`) and the `video/*` check live in `VideosService`, so they produce `FILE_TOO_LARGE` / `UNSUPPORTED_MEDIA_TYPE`. The DTOs are intentionally permissive on those two fields.
+- **Hidden existence:** a non-`ready` video requested by a non-owner returns `404 VIDEO_NOT_FOUND`, never 403.
+- **Consumer only in the worker:** `VideoProcessingProcessor` is registered in `WorkerModule` only — registering it in `VideosModule` would make the API consume jobs. Don't start a second worker inside `nestjs-api` either; the `video-worker` container is the consumer (production image: `Dockerfile.worker`).
+- **Job contract:** name `process`, payload `{ videoId }` (internal uuid, not `publicId`). Delivery is at-least-once, so the processor must stay idempotent.
+- **`WorkerModule` entities:** `autoLoadEntities` only discovers entities registered via `forFeature`, so the worker registers the whole relation graph `[Video, Channel, User]`. Omitting one fails boot with `Entity metadata for Video#channel was not found`. For the same reason, test `DataSource` entity lists that include `Channel` must include `Video`, and `cleanAllTables` deletes `videos` before `channels`.
+- **Two S3 clients:** `StorageService` uses a control-plane client on `STORAGE_ENDPOINT` (`minio:9000`) and a presigner on `STORAGE_PUBLIC_HOST` (the gateway). SigV4 signs the `Host` including the port, so `gateway/Caddyfile` must forward `header_up Host {hostport}` — `{host}` drops the port and every presigned URL fails with `SignatureDoesNotMatch`.
+- **Presigned URLs in tests:** inside the container `localhost:9000` is the container itself. Specs that fetch presigned URLs set `process.env.STORAGE_PUBLIC_HOST = 'http://storage-gateway:9000'` before bootstrapping the app.
+- **CommonJS pins:** the ts-jest stack is CommonJS, and the next majors of these libraries are ESM-only — keep `nanoid@^3`, `execa@^5`, `@nestjs/bullmq@^11`. Keep `ioredis` as an explicit dependency (optional peer that `bullmq@6` needs at runtime).
+- **SSE:** `@Sse` handlers return `Observable<MessageEvent>` with `MessageEvent` from `@nestjs/common`. E2E tests read the stream with `app.listen(0)` + `fetch` (supertest does not handle streaming).
 
 ## Code Conventions
 

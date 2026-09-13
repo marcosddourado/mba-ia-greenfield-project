@@ -8,23 +8,35 @@ More info in the project overview: [docs/project-plan.md](docs/project-plan.md)
 
 ## Repository Structure
 
-This is a monorepo with two main areas:
+This is a monorepo with three main areas:
 
-- `nestjs-project/` — Backend API (NestJS 11, TypeScript, Express). Contains modules for users, channels, videos, comments, etc.
-- `docs/` — Project documentation, architecture diagrams, and planning.
-- `next-frontend/` (Next.js) — not yet initialized
+- `nestjs-project/` — Backend API (NestJS 11, TypeScript, Express) plus the video worker entrypoint. Modules: auth, users, channels, mail, storage, queue, videos. See `nestjs-project/CLAUDE.md`.
+- `next-frontend/` — Frontend (Next.js 16, React 19). See `next-frontend/CLAUDE.md`.
+- `docs/` — Project documentation, architecture diagrams, and planning (`docs/decisions/`, `docs/phases/`).
 
 ## Architecture (C4 Container Diagram)
 
 See `docs/diagrams/software-arch.mermaid` for the full diagram. Key containers:
 
-- **Frontend** (Next.js) → calls API via REST, streams from Object Storage
-- **API** (Nest.js) → business rules, auth, reads/writes DB, uploads to storage, publishes jobs to queue, sends emails
-- **Video Worker** (FFmpeg) → consumes jobs from queue, processes videos, updates DB and storage
+- **Frontend** (Next.js) → calls API via REST, streams/downloads videos through presigned storage URLs
+- **API** (Nest.js) → business rules, auth, reads/writes DB, issues presigned storage URLs (never proxies video bytes), publishes jobs to queue, sends emails
+- **Video Worker** (FFmpeg) → dedicated `video-worker` container; consumes jobs from queue, extracts metadata + thumbnail, updates DB and storage
 - **Database** (PostgreSQL) → users, channels, videos, comments, likes
-- **Object Storage** (S3/MinIO) → video files and thumbnails
-- **Message Queue** (TBD) → video processing job queue
-- **Email Service** (SMTP) → account confirmation and password recovery
+- **Object Storage** (S3 API; MinIO in dev) → video files and thumbnails, reachable from the browser only through the `storage-gateway` reverse proxy
+- **Message Queue** (Redis + BullMQ) → `video-processing` job queue
+- **Email Service** (SMTP; Mailpit in dev) → account confirmation and password recovery
+
+## Video Pipeline (Phase 03)
+
+Upload and processing of videos up to 10 GB, designed so no app server ever carries the file bytes. Full contracts in `docs/phases/phase-03-videos/phase-03-videos.md`; decisions in `docs/decisions/technical-decisions-phase-03-videos.md`; implementation details in `nestjs-project/CLAUDE.md` → "Videos Module".
+
+1. `POST /videos` pre-registers the video as `draft` (unique short `publicId`) and opens an S3 multipart upload.
+2. The client asks for presigned part URLs and `PUT`s each part **directly to the storage gateway**, then calls `/upload/complete` with the part ETags.
+3. The API completes the multipart upload, sets the status to `processing`, and enqueues a `video-processing` job.
+4. The worker runs `ffprobe` (duration + metadata) and `ffmpeg` (thumbnail), then sets `ready` — or `failed` on error.
+5. `ready` videos are streamed (HTTP Range) and downloaded via 302 redirects to presigned gateway URLs.
+
+Status lifecycle stored in `videos.status`: `draft → uploading → processing → ready | failed`.
 
 ## Docker Networking
 
@@ -36,6 +48,8 @@ Inside a container, `localhost` refers to the container itself, not the host mac
 - **Wrong:** `DB_HOST=localhost`
 
 This applies to all environment variables, configuration files, and code that references service hosts.
+
+**One deliberate exception — URLs handed to the browser.** Presigned storage URLs are consumed by the browser, so they are signed against a browser-reachable public host (`STORAGE_PUBLIC_HOST`, e.g. `http://localhost:9000` = the `storage-gateway`), while server-side storage calls use the internal service name (`STORAGE_ENDPOINT=http://minio:9000`). Never sign presigned URLs against `minio:9000`, and never use the public host for server-to-server calls.
 
 ## Working Principles
 
